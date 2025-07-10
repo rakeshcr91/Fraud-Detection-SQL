@@ -1,21 +1,29 @@
--- SQL script for real-time fraud detection
+-- Extended SQL script for real-time fraud detection demo
+
+-- Drop existing tables if they exist
+DROP TABLE IF EXISTS Login_Alerts;
+DROP TABLE IF EXISTS Logins;
+DROP TABLE IF EXISTS Fraud_Alerts;
+DROP TABLE IF EXISTS Transactions;
+DROP TABLE IF EXISTS Accounts;
+DROP TABLE IF EXISTS Users;
 
 -- Create base tables
-CREATE TABLE IF NOT EXISTS Users (
+CREATE TABLE Users (
     user_id     SERIAL PRIMARY KEY,
     name        TEXT NOT NULL,
     email       TEXT NOT NULL UNIQUE,
     country     TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS Accounts (
+CREATE TABLE Accounts (
     account_id  SERIAL PRIMARY KEY,
     user_id     INTEGER NOT NULL REFERENCES Users(user_id),
     balance     NUMERIC(12,2) DEFAULT 0,
     device_id   TEXT
 );
 
-CREATE TABLE IF NOT EXISTS Transactions (
+CREATE TABLE Transactions (
     txn_id       SERIAL PRIMARY KEY,
     account_id   INTEGER NOT NULL REFERENCES Accounts(account_id),
     amount       NUMERIC(12,2) NOT NULL,
@@ -25,75 +33,81 @@ CREATE TABLE IF NOT EXISTS Transactions (
     txn_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Table to record suspicious activity
-CREATE TABLE IF NOT EXISTS Fraud_Alerts (
+-- Table to record suspicious transaction activity
+CREATE TABLE Fraud_Alerts (
     alert_id       SERIAL PRIMARY KEY,
     user_id        INTEGER NOT NULL REFERENCES Users(user_id),
     reason         TEXT NOT NULL,
     alert_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Stored procedure to check for suspicious activity
-CREATE OR REPLACE FUNCTION CheckForSuspiciousActivity() RETURNS TRIGGER AS $$
+-- Login table and alerts
+CREATE TABLE Logins (
+    login_id        SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES Users(user_id),
+    device_id       TEXT NOT NULL,
+    success         BOOLEAN NOT NULL,
+    country         TEXT NOT NULL,
+    login_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE Login_Alerts (
+    alert_id       SERIAL PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES Users(user_id),
+    reason         TEXT NOT NULL,
+    alert_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Stored procedure for transaction-based rules
+CREATE OR REPLACE FUNCTION CheckTransactionActivity() RETURNS TRIGGER AS $$
 BEGIN
     -- Rule 1: More than two transfers > $5000 within one hour
-    IF (TG_OP = 'INSERT') THEN
-        -- Count large transfers in the past hour for the same account
-        IF NEW.txn_type = 'transfer' AND NEW.amount > 5000 THEN
-            PERFORM 1 FROM Transactions
+    IF NEW.txn_type = 'transfer' AND NEW.amount > 5000 THEN
+        IF (
+            SELECT COUNT(*) FROM Transactions
             WHERE account_id = NEW.account_id
               AND txn_type = 'transfer'
               AND amount > 5000
-              AND txn_timestamp >= NEW.txn_timestamp - INTERVAL '1 hour';
-
-            IF FOUND THEN
-                -- Count again to see if there are already at least two others
-                IF (
-                    SELECT COUNT(*) FROM Transactions
-                    WHERE account_id = NEW.account_id
-                      AND txn_type = 'transfer'
-                      AND amount > 5000
-                      AND txn_timestamp >= NEW.txn_timestamp - INTERVAL '1 hour'
-                ) >= 2 THEN
-                    INSERT INTO Fraud_Alerts(user_id, reason, alert_timestamp)
-                    SELECT a.user_id,
-                           'More than two large transfers within an hour',
-                           NEW.txn_timestamp
-                    FROM Accounts a WHERE a.account_id = NEW.account_id;
-                END IF;
-            END IF;
-        END IF;
-
-        -- Rule 2: Transactions from different countries within 30 minutes
-        PERFORM 1 FROM Transactions t
-        JOIN Accounts a ON a.account_id = t.account_id
-        JOIN Accounts a2 ON a2.account_id = NEW.account_id
-        WHERE a.user_id = a2.user_id
-          AND t.country <> NEW.country
-          AND t.txn_timestamp >= NEW.txn_timestamp - INTERVAL '30 minutes'
-          AND t.txn_timestamp <= NEW.txn_timestamp + INTERVAL '30 minutes'
-          LIMIT 1;
-        IF FOUND THEN
+              AND txn_timestamp >= NEW.txn_timestamp - INTERVAL '1 hour'
+        ) >= 2 THEN
             INSERT INTO Fraud_Alerts(user_id, reason, alert_timestamp)
-            SELECT a2.user_id,
-                   'Transactions from different countries within 30 minutes',
+            SELECT a.user_id,
+                   'More than two large transfers within an hour',
                    NEW.txn_timestamp
-            FROM Accounts a2 WHERE a2.account_id = NEW.account_id;
+            FROM Accounts a WHERE a.account_id = NEW.account_id;
         END IF;
+    END IF;
 
-        -- Rule 3: New device used after midnight
-        IF NEW.device_id IS NOT NULL AND EXTRACT(HOUR FROM NEW.txn_timestamp) >= 0 AND EXTRACT(HOUR FROM NEW.txn_timestamp) < 6 THEN
-            PERFORM 1 FROM Transactions t
+    -- Rule 2: Transactions from different countries within 30 minutes
+    IF EXISTS (
+        SELECT 1 FROM Transactions t
+        JOIN Accounts a1 ON a1.account_id = t.account_id
+        JOIN Accounts a2 ON a2.account_id = NEW.account_id
+        WHERE a1.user_id = a2.user_id
+          AND t.country <> NEW.country
+          AND ABS(EXTRACT(EPOCH FROM (t.txn_timestamp - NEW.txn_timestamp))) <= 1800
+        LIMIT 1
+    ) THEN
+        INSERT INTO Fraud_Alerts(user_id, reason, alert_timestamp)
+        SELECT a2.user_id,
+               'Transactions from different countries within 30 minutes',
+               NEW.txn_timestamp
+        FROM Accounts a2 WHERE a2.account_id = NEW.account_id;
+    END IF;
+
+    -- Rule 3: New device used after midnight
+    IF NEW.device_id IS NOT NULL AND EXTRACT(HOUR FROM NEW.txn_timestamp) < 6 THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM Transactions t
             WHERE t.account_id = NEW.account_id
               AND t.device_id = NEW.device_id
-              LIMIT 1;
-            IF NOT FOUND THEN
-                INSERT INTO Fraud_Alerts(user_id, reason, alert_timestamp)
-                SELECT a.user_id,
-                       'New device used after midnight',
-                       NEW.txn_timestamp
-                FROM Accounts a WHERE a.account_id = NEW.account_id;
-            END IF;
+            LIMIT 1
+        ) THEN
+            INSERT INTO Fraud_Alerts(user_id, reason, alert_timestamp)
+            SELECT a.user_id,
+                   'New device used after midnight',
+                   NEW.txn_timestamp
+            FROM Accounts a WHERE a.account_id = NEW.account_id;
         END IF;
     END IF;
 
@@ -101,36 +115,1367 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Trigger to call the procedure on new transactions
-DROP TRIGGER IF EXISTS trg_check_suspicious ON Transactions;
-CREATE TRIGGER trg_check_suspicious
+-- Stored procedure for login-based rules
+CREATE OR REPLACE FUNCTION CheckLoginActivity() RETURNS TRIGGER AS $$
+BEGIN
+    -- Rule 1: More than 3 failed logins from same device within one hour
+    IF NOT NEW.success THEN
+        IF (
+            SELECT COUNT(*) FROM Logins l
+            WHERE l.user_id = NEW.user_id
+              AND l.device_id = NEW.device_id
+              AND NOT l.success
+              AND l.login_timestamp >= NEW.login_timestamp - INTERVAL '1 hour'
+        ) >= 3 THEN
+            INSERT INTO Login_Alerts(user_id, reason, alert_timestamp)
+            VALUES (NEW.user_id, 'Repeated failed logins from same device', NEW.login_timestamp);
+        END IF;
+    END IF;
+
+    -- Rule 2: Login from a new country after 22:00
+    IF EXTRACT(HOUR FROM NEW.login_timestamp) >= 22 THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM Logins l
+            WHERE l.user_id = NEW.user_id
+              AND l.country = NEW.country
+        ) THEN
+            INSERT INTO Login_Alerts(user_id, reason, alert_timestamp)
+            VALUES (NEW.user_id, 'Login from new country late at night', NEW.login_timestamp);
+        END IF;
+    END IF;
+
+    -- Rule 3: Login from unseen device
+    IF NOT EXISTS (
+        SELECT 1 FROM Logins l
+        WHERE l.user_id = NEW.user_id
+          AND l.device_id = NEW.device_id
+        LIMIT 1
+    ) THEN
+        INSERT INTO Login_Alerts(user_id, reason, alert_timestamp)
+        VALUES (NEW.user_id, 'Login from new device', NEW.login_timestamp);
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Triggers
+DROP TRIGGER IF EXISTS trg_check_txn ON Transactions;
+CREATE TRIGGER trg_check_txn
 AFTER INSERT ON Transactions
 FOR EACH ROW
-EXECUTE FUNCTION CheckForSuspiciousActivity();
+EXECUTE FUNCTION CheckTransactionActivity();
 
--- Sample data to simulate streaming events
-INSERT INTO Users(name, email, country) VALUES
-('Alice', 'alice@example.com', 'US'),
-('Bob', 'bob@example.com', 'US');
+DROP TRIGGER IF EXISTS trg_check_login ON Logins;
+CREATE TRIGGER trg_check_login
+AFTER INSERT ON Logins
+FOR EACH ROW
+EXECUTE FUNCTION CheckLoginActivity();
 
-INSERT INTO Accounts(user_id, balance, device_id) VALUES
-(1, 10000, 'device_a1'),
-(2, 5000, 'device_b1');
-
--- Simulate transactions
-INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp)
-VALUES
--- Large transfers for rule 1
-(1, 6000, 'transfer', 'US', 'device_a1', '2025-07-10 08:00:00'),
-(1, 7000, 'transfer', 'US', 'device_a1', '2025-07-10 08:30:00'),
-(1, 8000, 'transfer', 'US', 'device_a1', '2025-07-10 08:45:00'),
-
--- Different countries for rule 2
-(2, 100, 'purchase', 'US', 'device_b1', '2025-07-10 09:00:00'),
-(2, 50, 'purchase', 'CA', 'device_b1', '2025-07-10 09:25:00'),
-
--- New device after midnight for rule 3
-(1, 20, 'purchase', 'US', 'device_a2', '2025-07-11 01:15:00');
-
--- View fraud alerts
-SELECT * FROM Fraud_Alerts;
+-- ------------------------------------------------------------
+-- Sample Data Generation (over 1000 lines)
+-- ------------------------------------------------------------
+-- Users
+INSERT INTO Users(name, email, country) VALUES ('User1', 'user1@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User2', 'user2@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User3', 'user3@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User4', 'user4@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User5', 'user5@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User6', 'user6@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User7', 'user7@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User8', 'user8@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User9', 'user9@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User10', 'user10@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User11', 'user11@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User12', 'user12@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User13', 'user13@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User14', 'user14@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User15', 'user15@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User16', 'user16@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User17', 'user17@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User18', 'user18@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User19', 'user19@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User20', 'user20@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User21', 'user21@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User22', 'user22@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User23', 'user23@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User24', 'user24@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User25', 'user25@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User26', 'user26@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User27', 'user27@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User28', 'user28@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User29', 'user29@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User30', 'user30@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User31', 'user31@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User32', 'user32@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User33', 'user33@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User34', 'user34@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User35', 'user35@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User36', 'user36@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User37', 'user37@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User38', 'user38@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User39', 'user39@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User40', 'user40@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User41', 'user41@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User42', 'user42@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User43', 'user43@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User44', 'user44@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User45', 'user45@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User46', 'user46@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User47', 'user47@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User48', 'user48@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User49', 'user49@example.com', 'US');
+INSERT INTO Users(name, email, country) VALUES ('User50', 'user50@example.com', 'US');
+-- Accounts
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (1, 1010, 'dev1');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (2, 1020, 'dev2');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (3, 1030, 'dev3');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (4, 1040, 'dev4');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (5, 1050, 'dev5');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (6, 1060, 'dev6');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (7, 1070, 'dev7');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (8, 1080, 'dev8');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (9, 1090, 'dev9');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (10, 1100, 'dev10');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (11, 1110, 'dev11');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (12, 1120, 'dev12');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (13, 1130, 'dev13');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (14, 1140, 'dev14');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (15, 1150, 'dev15');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (16, 1160, 'dev16');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (17, 1170, 'dev17');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (18, 1180, 'dev18');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (19, 1190, 'dev19');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (20, 1200, 'dev20');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (21, 1210, 'dev21');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (22, 1220, 'dev22');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (23, 1230, 'dev23');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (24, 1240, 'dev24');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (25, 1250, 'dev25');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (26, 1260, 'dev26');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (27, 1270, 'dev27');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (28, 1280, 'dev28');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (29, 1290, 'dev29');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (30, 1300, 'dev30');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (31, 1310, 'dev31');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (32, 1320, 'dev32');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (33, 1330, 'dev33');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (34, 1340, 'dev34');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (35, 1350, 'dev35');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (36, 1360, 'dev36');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (37, 1370, 'dev37');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (38, 1380, 'dev38');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (39, 1390, 'dev39');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (40, 1400, 'dev40');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (41, 1410, 'dev41');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (42, 1420, 'dev42');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (43, 1430, 'dev43');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (44, 1440, 'dev44');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (45, 1450, 'dev45');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (46, 1460, 'dev46');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (47, 1470, 'dev47');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (48, 1480, 'dev48');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (49, 1490, 'dev49');
+INSERT INTO Accounts(user_id, balance, device_id) VALUES (50, 1500, 'dev50');
+-- Logins
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (31, 'dev6', TRUE, 'US', '2025-07-10 00:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev4', FALSE, 'GB', '2025-07-10 00:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev20', FALSE, 'CA', '2025-07-10 00:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (5, 'dev1', TRUE, 'US', '2025-07-10 00:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (26, 'dev1', TRUE, 'AU', '2025-07-10 00:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev7', FALSE, 'US', '2025-07-10 00:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (42, 'dev12', TRUE, 'US', '2025-07-10 00:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev14', FALSE, 'GB', '2025-07-10 00:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (32, 'dev13', FALSE, 'CA', '2025-07-10 00:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev8', FALSE, 'GB', '2025-07-10 00:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (31, 'dev4', TRUE, 'CA', '2025-07-10 00:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev6', FALSE, 'CA', '2025-07-10 00:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev4', TRUE, 'GB', '2025-07-10 00:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev3', TRUE, 'CA', '2025-07-10 00:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev3', TRUE, 'GB', '2025-07-10 00:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev1', TRUE, 'AU', '2025-07-10 00:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev4', FALSE, 'CA', '2025-07-10 00:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev2', FALSE, 'GB', '2025-07-10 00:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev1', TRUE, 'CA', '2025-07-10 00:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (20, 'dev7', FALSE, 'AU', '2025-07-10 00:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (9, 'dev15', FALSE, 'AU', '2025-07-10 00:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev2', FALSE, 'AU', '2025-07-10 00:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (49, 'dev2', FALSE, 'GB', '2025-07-10 00:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev16', FALSE, 'CA', '2025-07-10 00:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (20, 'dev15', TRUE, 'US', '2025-07-10 00:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev6', TRUE, 'US', '2025-07-10 00:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev6', FALSE, 'US', '2025-07-10 00:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev7', TRUE, 'GB', '2025-07-10 00:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (13, 'dev12', FALSE, 'GB', '2025-07-10 00:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev2', FALSE, 'US', '2025-07-10 01:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (11, 'dev5', TRUE, 'AU', '2025-07-10 01:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (26, 'dev15', TRUE, 'AU', '2025-07-10 01:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev12', FALSE, 'CA', '2025-07-10 01:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (36, 'dev4', FALSE, 'GB', '2025-07-10 01:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev9', FALSE, 'GB', '2025-07-10 01:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev14', TRUE, 'CA', '2025-07-10 01:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev3', FALSE, 'AU', '2025-07-10 01:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev15', FALSE, 'AU', '2025-07-10 01:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev7', FALSE, 'CA', '2025-07-10 01:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (41, 'dev5', FALSE, 'US', '2025-07-10 01:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev12', TRUE, 'GB', '2025-07-10 01:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev12', FALSE, 'AU', '2025-07-10 01:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev18', TRUE, 'CA', '2025-07-10 01:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev14', TRUE, 'US', '2025-07-10 01:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev19', FALSE, 'AU', '2025-07-10 01:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (16, 'dev5', FALSE, 'CA', '2025-07-10 01:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev13', FALSE, 'US', '2025-07-10 01:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev1', FALSE, 'GB', '2025-07-10 01:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev19', FALSE, 'AU', '2025-07-10 01:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (46, 'dev19', TRUE, 'CA', '2025-07-10 01:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev6', FALSE, 'CA', '2025-07-10 01:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev10', FALSE, 'GB', '2025-07-10 01:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev6', FALSE, 'GB', '2025-07-10 01:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev5', TRUE, 'AU', '2025-07-10 01:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (42, 'dev3', TRUE, 'AU', '2025-07-10 01:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev13', TRUE, 'AU', '2025-07-10 01:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (13, 'dev18', TRUE, 'GB', '2025-07-10 01:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (44, 'dev16', TRUE, 'AU', '2025-07-10 01:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (9, 'dev2', TRUE, 'CA', '2025-07-10 01:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (21, 'dev7', TRUE, 'AU', '2025-07-10 02:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev19', TRUE, 'CA', '2025-07-10 02:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (20, 'dev8', TRUE, 'GB', '2025-07-10 02:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev6', TRUE, 'CA', '2025-07-10 02:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (6, 'dev5', FALSE, 'AU', '2025-07-10 02:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (41, 'dev12', TRUE, 'AU', '2025-07-10 02:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (5, 'dev14', FALSE, 'AU', '2025-07-10 02:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev7', FALSE, 'GB', '2025-07-10 02:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev14', TRUE, 'AU', '2025-07-10 02:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev4', FALSE, 'CA', '2025-07-10 02:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev15', TRUE, 'US', '2025-07-10 02:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (35, 'dev1', FALSE, 'US', '2025-07-10 02:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (49, 'dev6', FALSE, 'CA', '2025-07-10 02:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (36, 'dev11', FALSE, 'US', '2025-07-10 02:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (6, 'dev10', TRUE, 'CA', '2025-07-10 02:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev19', TRUE, 'GB', '2025-07-10 02:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (3, 'dev10', FALSE, 'GB', '2025-07-10 02:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev9', TRUE, 'GB', '2025-07-10 02:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev1', TRUE, 'GB', '2025-07-10 02:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev11', FALSE, 'CA', '2025-07-10 02:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (35, 'dev3', FALSE, 'US', '2025-07-10 02:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev3', TRUE, 'AU', '2025-07-10 02:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev9', TRUE, 'US', '2025-07-10 02:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev7', TRUE, 'CA', '2025-07-10 02:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (44, 'dev14', TRUE, 'US', '2025-07-10 02:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev7', FALSE, 'CA', '2025-07-10 02:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev18', FALSE, 'US', '2025-07-10 02:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev3', FALSE, 'GB', '2025-07-10 02:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (20, 'dev15', TRUE, 'AU', '2025-07-10 02:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (15, 'dev18', TRUE, 'GB', '2025-07-10 02:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev20', FALSE, 'GB', '2025-07-10 03:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev1', FALSE, 'AU', '2025-07-10 03:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (36, 'dev4', TRUE, 'GB', '2025-07-10 03:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (15, 'dev11', TRUE, 'AU', '2025-07-10 03:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (11, 'dev20', FALSE, 'CA', '2025-07-10 03:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev7', TRUE, 'AU', '2025-07-10 03:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev16', FALSE, 'CA', '2025-07-10 03:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev5', FALSE, 'CA', '2025-07-10 03:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev2', TRUE, 'CA', '2025-07-10 03:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev16', TRUE, 'US', '2025-07-10 03:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (32, 'dev20', FALSE, 'AU', '2025-07-10 03:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (40, 'dev5', TRUE, 'AU', '2025-07-10 03:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev18', TRUE, 'AU', '2025-07-10 03:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (11, 'dev6', TRUE, 'CA', '2025-07-10 03:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev6', FALSE, 'GB', '2025-07-10 03:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev5', FALSE, 'US', '2025-07-10 03:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (40, 'dev12', TRUE, 'CA', '2025-07-10 03:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (41, 'dev13', TRUE, 'US', '2025-07-10 03:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev12', TRUE, 'AU', '2025-07-10 03:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev2', TRUE, 'GB', '2025-07-10 03:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev4', FALSE, 'GB', '2025-07-10 03:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (33, 'dev1', TRUE, 'GB', '2025-07-10 03:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev12', TRUE, 'US', '2025-07-10 03:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev19', FALSE, 'CA', '2025-07-10 03:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev17', TRUE, 'US', '2025-07-10 03:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (6, 'dev13', FALSE, 'CA', '2025-07-10 03:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev5', FALSE, 'AU', '2025-07-10 03:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (35, 'dev8', FALSE, 'US', '2025-07-10 03:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev19', FALSE, 'CA', '2025-07-10 03:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (26, 'dev6', FALSE, 'AU', '2025-07-10 03:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (21, 'dev16', FALSE, 'CA', '2025-07-10 04:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (14, 'dev13', FALSE, 'GB', '2025-07-10 04:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (35, 'dev1', FALSE, 'US', '2025-07-10 04:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev6', TRUE, 'AU', '2025-07-10 04:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (31, 'dev1', FALSE, 'AU', '2025-07-10 04:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev5', FALSE, 'GB', '2025-07-10 04:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (42, 'dev14', FALSE, 'AU', '2025-07-10 04:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev11', FALSE, 'AU', '2025-07-10 04:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (15, 'dev2', FALSE, 'GB', '2025-07-10 04:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev9', FALSE, 'CA', '2025-07-10 04:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (15, 'dev7', TRUE, 'AU', '2025-07-10 04:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev4', TRUE, 'GB', '2025-07-10 04:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (31, 'dev6', TRUE, 'US', '2025-07-10 04:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (40, 'dev4', FALSE, 'US', '2025-07-10 04:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (6, 'dev17', FALSE, 'US', '2025-07-10 04:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (40, 'dev14', TRUE, 'US', '2025-07-10 04:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (5, 'dev16', TRUE, 'GB', '2025-07-10 04:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev1', TRUE, 'GB', '2025-07-10 04:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev6', FALSE, 'CA', '2025-07-10 04:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev12', TRUE, 'AU', '2025-07-10 04:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (6, 'dev2', TRUE, 'US', '2025-07-10 04:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev18', FALSE, 'US', '2025-07-10 04:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (11, 'dev1', TRUE, 'GB', '2025-07-10 04:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev13', TRUE, 'US', '2025-07-10 04:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (34, 'dev16', TRUE, 'AU', '2025-07-10 04:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (9, 'dev4', TRUE, 'AU', '2025-07-10 04:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev15', TRUE, 'AU', '2025-07-10 04:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (33, 'dev7', FALSE, 'AU', '2025-07-10 04:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev13', TRUE, 'CA', '2025-07-10 04:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev1', FALSE, 'GB', '2025-07-10 04:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (38, 'dev6', FALSE, 'GB', '2025-07-10 05:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (34, 'dev2', TRUE, 'US', '2025-07-10 05:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (6, 'dev6', FALSE, 'GB', '2025-07-10 05:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev18', FALSE, 'CA', '2025-07-10 05:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (9, 'dev12', FALSE, 'US', '2025-07-10 05:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (32, 'dev2', TRUE, 'GB', '2025-07-10 05:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev7', FALSE, 'US', '2025-07-10 05:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev12', TRUE, 'GB', '2025-07-10 05:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev11', TRUE, 'GB', '2025-07-10 05:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev5', FALSE, 'US', '2025-07-10 05:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev6', FALSE, 'CA', '2025-07-10 05:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (13, 'dev17', TRUE, 'GB', '2025-07-10 05:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev9', FALSE, 'AU', '2025-07-10 05:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev10', FALSE, 'AU', '2025-07-10 05:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev20', TRUE, 'GB', '2025-07-10 05:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (34, 'dev16', TRUE, 'GB', '2025-07-10 05:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (21, 'dev11', TRUE, 'GB', '2025-07-10 05:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev5', TRUE, 'CA', '2025-07-10 05:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (14, 'dev14', FALSE, 'AU', '2025-07-10 05:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev1', FALSE, 'US', '2025-07-10 05:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev18', TRUE, 'AU', '2025-07-10 05:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (33, 'dev19', FALSE, 'CA', '2025-07-10 05:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev3', FALSE, 'GB', '2025-07-10 05:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (10, 'dev17', FALSE, 'AU', '2025-07-10 05:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev17', FALSE, 'GB', '2025-07-10 05:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (48, 'dev4', TRUE, 'US', '2025-07-10 05:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev4', FALSE, 'AU', '2025-07-10 05:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (15, 'dev19', FALSE, 'US', '2025-07-10 05:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (5, 'dev13', TRUE, 'CA', '2025-07-10 05:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (48, 'dev9', TRUE, 'GB', '2025-07-10 05:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (35, 'dev17', FALSE, 'GB', '2025-07-10 06:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev10', FALSE, 'GB', '2025-07-10 06:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev1', FALSE, 'AU', '2025-07-10 06:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev18', TRUE, 'GB', '2025-07-10 06:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev9', FALSE, 'US', '2025-07-10 06:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (31, 'dev18', TRUE, 'AU', '2025-07-10 06:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev19', TRUE, 'GB', '2025-07-10 06:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev20', TRUE, 'US', '2025-07-10 06:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev10', TRUE, 'GB', '2025-07-10 06:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev1', TRUE, 'US', '2025-07-10 06:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (34, 'dev1', TRUE, 'CA', '2025-07-10 06:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev3', TRUE, 'CA', '2025-07-10 06:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev19', TRUE, 'CA', '2025-07-10 06:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev4', TRUE, 'US', '2025-07-10 06:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (11, 'dev3', TRUE, 'AU', '2025-07-10 06:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (32, 'dev3', FALSE, 'AU', '2025-07-10 06:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev10', FALSE, 'CA', '2025-07-10 06:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (26, 'dev14', TRUE, 'US', '2025-07-10 06:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev5', FALSE, 'AU', '2025-07-10 06:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev16', FALSE, 'GB', '2025-07-10 06:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev11', TRUE, 'GB', '2025-07-10 06:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (43, 'dev16', FALSE, 'GB', '2025-07-10 06:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev12', FALSE, 'AU', '2025-07-10 06:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev10', FALSE, 'CA', '2025-07-10 06:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev15', FALSE, 'US', '2025-07-10 06:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev19', FALSE, 'AU', '2025-07-10 06:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev3', FALSE, 'US', '2025-07-10 06:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (34, 'dev18', FALSE, 'US', '2025-07-10 06:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev20', FALSE, 'US', '2025-07-10 06:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (46, 'dev10', FALSE, 'CA', '2025-07-10 06:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev18', FALSE, 'GB', '2025-07-10 07:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (13, 'dev9', TRUE, 'AU', '2025-07-10 07:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev2', FALSE, 'AU', '2025-07-10 07:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev20', TRUE, 'GB', '2025-07-10 07:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (21, 'dev4', TRUE, 'CA', '2025-07-10 07:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (49, 'dev4', FALSE, 'AU', '2025-07-10 07:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (32, 'dev15', TRUE, 'AU', '2025-07-10 07:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev2', FALSE, 'AU', '2025-07-10 07:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (11, 'dev18', TRUE, 'GB', '2025-07-10 07:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev16', TRUE, 'GB', '2025-07-10 07:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev8', FALSE, 'US', '2025-07-10 07:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (14, 'dev17', TRUE, 'GB', '2025-07-10 07:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (5, 'dev15', FALSE, 'US', '2025-07-10 07:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (32, 'dev6', TRUE, 'GB', '2025-07-10 07:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (48, 'dev19', FALSE, 'US', '2025-07-10 07:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (21, 'dev11', TRUE, 'GB', '2025-07-10 07:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev1', TRUE, 'AU', '2025-07-10 07:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev11', TRUE, 'GB', '2025-07-10 07:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev13', TRUE, 'US', '2025-07-10 07:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev18', FALSE, 'CA', '2025-07-10 07:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev20', FALSE, 'AU', '2025-07-10 07:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev1', FALSE, 'US', '2025-07-10 07:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev9', FALSE, 'CA', '2025-07-10 07:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (43, 'dev15', TRUE, 'CA', '2025-07-10 07:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev2', FALSE, 'AU', '2025-07-10 07:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (43, 'dev14', FALSE, 'CA', '2025-07-10 07:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (36, 'dev19', FALSE, 'CA', '2025-07-10 07:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev1', TRUE, 'AU', '2025-07-10 07:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (39, 'dev14', FALSE, 'CA', '2025-07-10 07:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev14', TRUE, 'CA', '2025-07-10 07:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev16', TRUE, 'AU', '2025-07-10 08:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev20', FALSE, 'GB', '2025-07-10 08:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev10', TRUE, 'US', '2025-07-10 08:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (9, 'dev10', TRUE, 'CA', '2025-07-10 08:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev1', TRUE, 'GB', '2025-07-10 08:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (10, 'dev5', TRUE, 'CA', '2025-07-10 08:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev9', TRUE, 'US', '2025-07-10 08:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (14, 'dev16', FALSE, 'AU', '2025-07-10 08:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev11', TRUE, 'US', '2025-07-10 08:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (20, 'dev10', FALSE, 'CA', '2025-07-10 08:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev5', TRUE, 'AU', '2025-07-10 08:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (33, 'dev13', TRUE, 'AU', '2025-07-10 08:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev18', FALSE, 'GB', '2025-07-10 08:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (13, 'dev5', TRUE, 'GB', '2025-07-10 08:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev15', TRUE, 'US', '2025-07-10 08:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev15', TRUE, 'US', '2025-07-10 08:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (46, 'dev5', FALSE, 'AU', '2025-07-10 08:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev10', FALSE, 'CA', '2025-07-10 08:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev10', TRUE, 'AU', '2025-07-10 08:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev6', FALSE, 'AU', '2025-07-10 08:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev6', TRUE, 'CA', '2025-07-10 08:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev4', FALSE, 'GB', '2025-07-10 08:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev7', FALSE, 'US', '2025-07-10 08:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (33, 'dev9', TRUE, 'US', '2025-07-10 08:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev14', TRUE, 'AU', '2025-07-10 08:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (3, 'dev20', TRUE, 'US', '2025-07-10 08:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (46, 'dev20', TRUE, 'GB', '2025-07-10 08:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (48, 'dev1', FALSE, 'US', '2025-07-10 08:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev1', TRUE, 'US', '2025-07-10 08:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev15', TRUE, 'US', '2025-07-10 08:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (46, 'dev5', TRUE, 'US', '2025-07-10 09:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev18', FALSE, 'GB', '2025-07-10 09:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (49, 'dev14', TRUE, 'GB', '2025-07-10 09:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev17', TRUE, 'AU', '2025-07-10 09:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev20', FALSE, 'CA', '2025-07-10 09:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (39, 'dev6', TRUE, 'GB', '2025-07-10 09:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev19', FALSE, 'GB', '2025-07-10 09:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev14', TRUE, 'CA', '2025-07-10 09:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (41, 'dev9', FALSE, 'GB', '2025-07-10 09:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev8', FALSE, 'GB', '2025-07-10 09:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev15', TRUE, 'CA', '2025-07-10 09:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev12', FALSE, 'US', '2025-07-10 09:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev4', FALSE, 'AU', '2025-07-10 09:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev7', FALSE, 'GB', '2025-07-10 09:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev10', TRUE, 'CA', '2025-07-10 09:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev4', FALSE, 'AU', '2025-07-10 09:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev3', FALSE, 'GB', '2025-07-10 09:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (9, 'dev7', TRUE, 'US', '2025-07-10 09:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev1', FALSE, 'AU', '2025-07-10 09:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (10, 'dev1', TRUE, 'US', '2025-07-10 09:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev2', FALSE, 'GB', '2025-07-10 09:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev18', TRUE, 'US', '2025-07-10 09:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (39, 'dev5', TRUE, 'GB', '2025-07-10 09:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev7', TRUE, 'GB', '2025-07-10 09:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (5, 'dev18', FALSE, 'AU', '2025-07-10 09:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev1', TRUE, 'CA', '2025-07-10 09:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev12', TRUE, 'CA', '2025-07-10 09:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (14, 'dev18', FALSE, 'US', '2025-07-10 09:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev10', TRUE, 'CA', '2025-07-10 09:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev18', TRUE, 'AU', '2025-07-10 09:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (34, 'dev6', TRUE, 'US', '2025-07-10 10:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev7', FALSE, 'AU', '2025-07-10 10:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (43, 'dev17', TRUE, 'GB', '2025-07-10 10:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev15', TRUE, 'AU', '2025-07-10 10:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (5, 'dev2', FALSE, 'CA', '2025-07-10 10:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (36, 'dev18', TRUE, 'US', '2025-07-10 10:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev12', TRUE, 'GB', '2025-07-10 10:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev18', TRUE, 'US', '2025-07-10 10:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev16', TRUE, 'AU', '2025-07-10 10:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev16', FALSE, 'US', '2025-07-10 10:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev7', FALSE, 'AU', '2025-07-10 10:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev13', FALSE, 'US', '2025-07-10 10:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev7', FALSE, 'AU', '2025-07-10 10:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (6, 'dev19', TRUE, 'US', '2025-07-10 10:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev18', TRUE, 'CA', '2025-07-10 10:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev13', FALSE, 'US', '2025-07-10 10:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (21, 'dev1', FALSE, 'AU', '2025-07-10 10:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (12, 'dev16', FALSE, 'CA', '2025-07-10 10:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev1', FALSE, 'AU', '2025-07-10 10:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (49, 'dev7', TRUE, 'AU', '2025-07-10 10:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (40, 'dev17', TRUE, 'GB', '2025-07-10 10:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev9', TRUE, 'AU', '2025-07-10 10:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (9, 'dev11', FALSE, 'AU', '2025-07-10 10:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev5', FALSE, 'US', '2025-07-10 10:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (22, 'dev15', TRUE, 'AU', '2025-07-10 10:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev6', FALSE, 'GB', '2025-07-10 10:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev4', FALSE, 'AU', '2025-07-10 10:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev13', FALSE, 'US', '2025-07-10 10:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev20', TRUE, 'US', '2025-07-10 10:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (26, 'dev7', TRUE, 'CA', '2025-07-10 10:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (48, 'dev17', TRUE, 'GB', '2025-07-10 11:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev19', FALSE, 'US', '2025-07-10 11:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev14', FALSE, 'CA', '2025-07-10 11:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (26, 'dev20', TRUE, 'AU', '2025-07-10 11:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (31, 'dev4', FALSE, 'CA', '2025-07-10 11:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev3', FALSE, 'CA', '2025-07-10 11:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (29, 'dev18', FALSE, 'AU', '2025-07-10 11:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (21, 'dev3', FALSE, 'CA', '2025-07-10 11:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (32, 'dev13', TRUE, 'GB', '2025-07-10 11:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (7, 'dev11', FALSE, 'GB', '2025-07-10 11:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev20', FALSE, 'AU', '2025-07-10 11:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (39, 'dev12', FALSE, 'GB', '2025-07-10 11:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (25, 'dev4', TRUE, 'US', '2025-07-10 11:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev14', TRUE, 'CA', '2025-07-10 11:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (49, 'dev10', TRUE, 'US', '2025-07-10 11:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (35, 'dev13', TRUE, 'CA', '2025-07-10 11:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev12', FALSE, 'US', '2025-07-10 11:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (37, 'dev14', FALSE, 'GB', '2025-07-10 11:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev11', TRUE, 'AU', '2025-07-10 11:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev7', FALSE, 'AU', '2025-07-10 11:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (10, 'dev10', TRUE, 'AU', '2025-07-10 11:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (43, 'dev4', FALSE, 'CA', '2025-07-10 11:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev6', TRUE, 'US', '2025-07-10 11:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (41, 'dev20', TRUE, 'AU', '2025-07-10 11:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (50, 'dev20', TRUE, 'GB', '2025-07-10 11:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (38, 'dev1', FALSE, 'GB', '2025-07-10 11:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (5, 'dev16', FALSE, 'CA', '2025-07-10 11:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (42, 'dev14', TRUE, 'GB', '2025-07-10 11:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (34, 'dev19', FALSE, 'AU', '2025-07-10 11:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (4, 'dev12', TRUE, 'CA', '2025-07-10 11:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev19', FALSE, 'GB', '2025-07-10 12:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (36, 'dev20', FALSE, 'US', '2025-07-10 12:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev8', FALSE, 'AU', '2025-07-10 12:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (9, 'dev13', FALSE, 'AU', '2025-07-10 12:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (45, 'dev8', FALSE, 'US', '2025-07-10 12:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (46, 'dev14', FALSE, 'CA', '2025-07-10 12:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (33, 'dev2', FALSE, 'GB', '2025-07-10 12:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev19', FALSE, 'US', '2025-07-10 12:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev16', TRUE, 'AU', '2025-07-10 12:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (19, 'dev11', TRUE, 'CA', '2025-07-10 12:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev6', TRUE, 'CA', '2025-07-10 12:20:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (16, 'dev2', TRUE, 'AU', '2025-07-10 12:22:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (48, 'dev6', FALSE, 'GB', '2025-07-10 12:24:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (40, 'dev16', FALSE, 'GB', '2025-07-10 12:26:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (23, 'dev4', FALSE, 'CA', '2025-07-10 12:28:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (49, 'dev2', FALSE, 'US', '2025-07-10 12:30:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (13, 'dev14', FALSE, 'CA', '2025-07-10 12:32:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (48, 'dev2', FALSE, 'GB', '2025-07-10 12:34:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (32, 'dev7', TRUE, 'CA', '2025-07-10 12:36:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (13, 'dev19', FALSE, 'AU', '2025-07-10 12:38:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (17, 'dev1', TRUE, 'GB', '2025-07-10 12:40:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (33, 'dev10', TRUE, 'CA', '2025-07-10 12:42:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (30, 'dev14', FALSE, 'GB', '2025-07-10 12:44:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (28, 'dev19', FALSE, 'CA', '2025-07-10 12:46:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (2, 'dev7', TRUE, 'GB', '2025-07-10 12:48:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (10, 'dev2', FALSE, 'US', '2025-07-10 12:50:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (38, 'dev10', FALSE, 'AU', '2025-07-10 12:52:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (43, 'dev10', TRUE, 'AU', '2025-07-10 12:54:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev9', TRUE, 'US', '2025-07-10 12:56:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (35, 'dev14', FALSE, 'US', '2025-07-10 12:58:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (24, 'dev13', TRUE, 'AU', '2025-07-10 13:00:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (47, 'dev5', TRUE, 'AU', '2025-07-10 13:02:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (13, 'dev15', FALSE, 'GB', '2025-07-10 13:04:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (16, 'dev18', FALSE, 'AU', '2025-07-10 13:06:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (26, 'dev12', FALSE, 'CA', '2025-07-10 13:08:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (8, 'dev19', FALSE, 'AU', '2025-07-10 13:10:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev16', FALSE, 'AU', '2025-07-10 13:12:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (1, 'dev1', TRUE, 'GB', '2025-07-10 13:14:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (27, 'dev6', TRUE, 'US', '2025-07-10 13:16:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (18, 'dev3', TRUE, 'AU', '2025-07-10 13:18:00');
+INSERT INTO Logins(user_id, device_id, success, country, login_timestamp) VALUES (46, 'dev14', FALSE, 'AU', '2025-07-10 13:20:00');
+-- Transactions
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 8853, 'withdrawal', 'GB', 'dev18', '2025-07-10 00:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 9433, 'purchase', 'US', 'dev9', '2025-07-10 00:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 7156, 'withdrawal', 'AU', 'dev8', '2025-07-10 00:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 2345, 'withdrawal', 'GB', 'dev7', '2025-07-10 00:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 7436, 'transfer', 'CA', 'dev9', '2025-07-10 00:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 2773, 'transfer', 'AU', 'dev19', '2025-07-10 00:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 5602, 'transfer', 'US', 'dev4', '2025-07-10 00:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (36, 5280, 'withdrawal', 'CA', 'dev6', '2025-07-10 00:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 1342, 'transfer', 'CA', 'dev18', '2025-07-10 00:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 4595, 'transfer', 'US', 'dev11', '2025-07-10 00:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 17, 'purchase', 'CA', 'dev14', '2025-07-10 00:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 8707, 'transfer', 'GB', 'dev13', '2025-07-10 00:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 1007, 'withdrawal', 'US', 'dev3', '2025-07-10 00:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 9726, 'withdrawal', 'GB', 'dev1', '2025-07-10 00:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 5504, 'purchase', 'AU', 'dev13', '2025-07-10 00:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 7431, 'purchase', 'CA', 'dev6', '2025-07-10 00:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 1152, 'transfer', 'US', 'dev13', '2025-07-10 00:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 8044, 'purchase', 'CA', 'dev7', '2025-07-10 00:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 9749, 'withdrawal', 'AU', 'dev10', '2025-07-10 00:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 7257, 'withdrawal', 'AU', 'dev13', '2025-07-10 00:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 9508, 'purchase', 'GB', 'dev10', '2025-07-10 00:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 5430, 'purchase', 'US', 'dev11', '2025-07-10 00:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 4, 'withdrawal', 'US', 'dev11', '2025-07-10 00:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 4478, 'purchase', 'US', 'dev9', '2025-07-10 00:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 4600, 'purchase', 'AU', 'dev12', '2025-07-10 00:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 9320, 'withdrawal', 'AU', 'dev13', '2025-07-10 00:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 9675, 'purchase', 'GB', 'dev14', '2025-07-10 00:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 4366, 'purchase', 'CA', 'dev10', '2025-07-10 00:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 3583, 'transfer', 'AU', 'dev12', '2025-07-10 00:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 8134, 'transfer', 'CA', 'dev1', '2025-07-10 00:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 8823, 'purchase', 'GB', 'dev13', '2025-07-10 00:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 7352, 'transfer', 'US', 'dev11', '2025-07-10 00:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 5504, 'transfer', 'CA', 'dev7', '2025-07-10 00:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 3298, 'purchase', 'GB', 'dev5', '2025-07-10 00:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 414, 'purchase', 'GB', 'dev12', '2025-07-10 00:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 6803, 'withdrawal', 'US', 'dev10', '2025-07-10 00:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 298, 'withdrawal', 'US', 'dev15', '2025-07-10 00:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 867, 'transfer', 'AU', 'dev20', '2025-07-10 00:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 1695, 'purchase', 'US', 'dev18', '2025-07-10 00:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 7872, 'purchase', 'CA', 'dev12', '2025-07-10 00:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 1459, 'purchase', 'CA', 'dev1', '2025-07-10 00:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 922, 'withdrawal', 'US', 'dev13', '2025-07-10 00:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 3797, 'transfer', 'GB', 'dev20', '2025-07-10 00:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 4354, 'withdrawal', 'AU', 'dev14', '2025-07-10 00:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 2623, 'withdrawal', 'AU', 'dev20', '2025-07-10 00:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 5828, 'withdrawal', 'AU', 'dev20', '2025-07-10 00:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 2488, 'purchase', 'AU', 'dev2', '2025-07-10 00:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 9298, 'withdrawal', 'CA', 'dev2', '2025-07-10 00:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 4158, 'purchase', 'AU', 'dev12', '2025-07-10 00:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 8976, 'withdrawal', 'GB', 'dev16', '2025-07-10 00:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 6852, 'withdrawal', 'GB', 'dev6', '2025-07-10 00:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 1880, 'withdrawal', 'US', 'dev11', '2025-07-10 00:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 4548, 'withdrawal', 'GB', 'dev5', '2025-07-10 00:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 5497, 'purchase', 'CA', 'dev8', '2025-07-10 00:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 3536, 'transfer', 'US', 'dev11', '2025-07-10 00:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 3275, 'withdrawal', 'US', 'dev8', '2025-07-10 00:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 4966, 'withdrawal', 'US', 'dev15', '2025-07-10 00:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 3909, 'purchase', 'US', 'dev15', '2025-07-10 00:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 7399, 'transfer', 'AU', 'dev17', '2025-07-10 00:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 3846, 'transfer', 'GB', 'dev8', '2025-07-10 01:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 4414, 'withdrawal', 'GB', 'dev7', '2025-07-10 01:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 3221, 'transfer', 'GB', 'dev10', '2025-07-10 01:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 7263, 'transfer', 'GB', 'dev6', '2025-07-10 01:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 2888, 'transfer', 'US', 'dev4', '2025-07-10 01:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 7684, 'transfer', 'GB', 'dev15', '2025-07-10 01:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 6747, 'withdrawal', 'GB', 'dev18', '2025-07-10 01:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 4763, 'purchase', 'GB', 'dev9', '2025-07-10 01:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 6707, 'withdrawal', 'US', 'dev4', '2025-07-10 01:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 9982, 'purchase', 'CA', 'dev2', '2025-07-10 01:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 6756, 'purchase', 'GB', 'dev1', '2025-07-10 01:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 2122, 'withdrawal', 'GB', 'dev1', '2025-07-10 01:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 2801, 'purchase', 'CA', 'dev3', '2025-07-10 01:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 3018, 'withdrawal', 'AU', 'dev16', '2025-07-10 01:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 3834, 'purchase', 'GB', 'dev2', '2025-07-10 01:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 7775, 'transfer', 'CA', 'dev8', '2025-07-10 01:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 4971, 'purchase', 'AU', 'dev7', '2025-07-10 01:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 1288, 'purchase', 'US', 'dev20', '2025-07-10 01:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (5, 7850, 'transfer', 'US', 'dev8', '2025-07-10 01:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 2430, 'transfer', 'GB', 'dev13', '2025-07-10 01:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 8518, 'withdrawal', 'CA', 'dev4', '2025-07-10 01:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 2128, 'transfer', 'CA', 'dev8', '2025-07-10 01:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 5365, 'withdrawal', 'US', 'dev7', '2025-07-10 01:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 1887, 'withdrawal', 'US', 'dev7', '2025-07-10 01:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 1638, 'purchase', 'CA', 'dev4', '2025-07-10 01:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 3128, 'purchase', 'GB', 'dev2', '2025-07-10 01:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 4997, 'purchase', 'AU', 'dev4', '2025-07-10 01:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 3836, 'transfer', 'AU', 'dev1', '2025-07-10 01:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 4751, 'purchase', 'CA', 'dev4', '2025-07-10 01:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 8139, 'purchase', 'CA', 'dev20', '2025-07-10 01:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 2353, 'withdrawal', 'US', 'dev16', '2025-07-10 01:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 2357, 'transfer', 'GB', 'dev11', '2025-07-10 01:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 4173, 'withdrawal', 'GB', 'dev15', '2025-07-10 01:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 2245, 'withdrawal', 'AU', 'dev12', '2025-07-10 01:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 2295, 'withdrawal', 'CA', 'dev1', '2025-07-10 01:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 7150, 'purchase', 'GB', 'dev18', '2025-07-10 01:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (5, 8193, 'withdrawal', 'GB', 'dev16', '2025-07-10 01:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 6985, 'withdrawal', 'GB', 'dev18', '2025-07-10 01:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 711, 'withdrawal', 'GB', 'dev13', '2025-07-10 01:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 5080, 'transfer', 'AU', 'dev13', '2025-07-10 01:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 473, 'withdrawal', 'CA', 'dev15', '2025-07-10 01:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 4879, 'transfer', 'GB', 'dev16', '2025-07-10 01:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 6613, 'transfer', 'GB', 'dev6', '2025-07-10 01:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 6742, 'transfer', 'CA', 'dev16', '2025-07-10 01:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 1310, 'purchase', 'US', 'dev19', '2025-07-10 01:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 2428, 'purchase', 'CA', 'dev10', '2025-07-10 01:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 7299, 'purchase', 'CA', 'dev13', '2025-07-10 01:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 3268, 'withdrawal', 'US', 'dev6', '2025-07-10 01:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 3438, 'withdrawal', 'US', 'dev10', '2025-07-10 01:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 3549, 'transfer', 'CA', 'dev10', '2025-07-10 01:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 5831, 'withdrawal', 'US', 'dev16', '2025-07-10 01:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 4231, 'transfer', 'CA', 'dev20', '2025-07-10 01:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 6910, 'purchase', 'GB', 'dev16', '2025-07-10 01:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 8813, 'transfer', 'CA', 'dev3', '2025-07-10 01:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 4562, 'purchase', 'US', 'dev14', '2025-07-10 01:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 2481, 'withdrawal', 'CA', 'dev1', '2025-07-10 01:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 249, 'purchase', 'US', 'dev8', '2025-07-10 01:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 3657, 'withdrawal', 'AU', 'dev3', '2025-07-10 01:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 9138, 'transfer', 'GB', 'dev15', '2025-07-10 01:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 9828, 'purchase', 'CA', 'dev17', '2025-07-10 01:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 219, 'purchase', 'GB', 'dev18', '2025-07-10 02:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 1732, 'withdrawal', 'GB', 'dev2', '2025-07-10 02:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 8266, 'withdrawal', 'GB', 'dev20', '2025-07-10 02:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (36, 4095, 'withdrawal', 'GB', 'dev12', '2025-07-10 02:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 7444, 'purchase', 'CA', 'dev2', '2025-07-10 02:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 5574, 'purchase', 'GB', 'dev2', '2025-07-10 02:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 9032, 'transfer', 'GB', 'dev6', '2025-07-10 02:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 6376, 'transfer', 'CA', 'dev12', '2025-07-10 02:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 4698, 'transfer', 'AU', 'dev8', '2025-07-10 02:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 8269, 'transfer', 'US', 'dev20', '2025-07-10 02:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 6904, 'purchase', 'US', 'dev7', '2025-07-10 02:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 3960, 'withdrawal', 'CA', 'dev6', '2025-07-10 02:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 8009, 'purchase', 'AU', 'dev12', '2025-07-10 02:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 9071, 'purchase', 'AU', 'dev7', '2025-07-10 02:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (36, 6713, 'withdrawal', 'GB', 'dev3', '2025-07-10 02:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 8059, 'purchase', 'GB', 'dev6', '2025-07-10 02:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 2657, 'purchase', 'US', 'dev13', '2025-07-10 02:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 2927, 'transfer', 'GB', 'dev6', '2025-07-10 02:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 431, 'purchase', 'CA', 'dev3', '2025-07-10 02:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 2176, 'transfer', 'GB', 'dev14', '2025-07-10 02:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 9915, 'withdrawal', 'GB', 'dev2', '2025-07-10 02:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 8460, 'withdrawal', 'GB', 'dev18', '2025-07-10 02:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 2220, 'withdrawal', 'GB', 'dev4', '2025-07-10 02:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 6992, 'purchase', 'AU', 'dev3', '2025-07-10 02:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 4076, 'withdrawal', 'GB', 'dev14', '2025-07-10 02:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 289, 'purchase', 'CA', 'dev16', '2025-07-10 02:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 8540, 'withdrawal', 'GB', 'dev4', '2025-07-10 02:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 8228, 'transfer', 'US', 'dev10', '2025-07-10 02:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (5, 5917, 'withdrawal', 'GB', 'dev14', '2025-07-10 02:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 3459, 'purchase', 'AU', 'dev18', '2025-07-10 02:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 4918, 'withdrawal', 'US', 'dev2', '2025-07-10 02:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 5839, 'withdrawal', 'GB', 'dev17', '2025-07-10 02:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 4882, 'purchase', 'AU', 'dev14', '2025-07-10 02:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 4912, 'withdrawal', 'CA', 'dev5', '2025-07-10 02:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 2180, 'transfer', 'GB', 'dev3', '2025-07-10 02:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 6800, 'withdrawal', 'US', 'dev13', '2025-07-10 02:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 7612, 'withdrawal', 'CA', 'dev17', '2025-07-10 02:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 8651, 'withdrawal', 'GB', 'dev7', '2025-07-10 02:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 2567, 'purchase', 'US', 'dev8', '2025-07-10 02:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 3364, 'transfer', 'CA', 'dev5', '2025-07-10 02:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 3082, 'purchase', 'CA', 'dev19', '2025-07-10 02:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 9205, 'transfer', 'GB', 'dev15', '2025-07-10 02:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 7320, 'purchase', 'US', 'dev1', '2025-07-10 02:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 2677, 'transfer', 'US', 'dev4', '2025-07-10 02:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 9492, 'withdrawal', 'US', 'dev17', '2025-07-10 02:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 1450, 'withdrawal', 'CA', 'dev3', '2025-07-10 02:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 938, 'purchase', 'US', 'dev10', '2025-07-10 02:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 9077, 'purchase', 'GB', 'dev3', '2025-07-10 02:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 354, 'purchase', 'CA', 'dev15', '2025-07-10 02:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 5322, 'transfer', 'US', 'dev10', '2025-07-10 02:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 3699, 'withdrawal', 'US', 'dev16', '2025-07-10 02:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 8646, 'withdrawal', 'GB', 'dev8', '2025-07-10 02:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 1953, 'withdrawal', 'CA', 'dev10', '2025-07-10 02:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 8871, 'transfer', 'CA', 'dev13', '2025-07-10 02:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 5648, 'transfer', 'CA', 'dev8', '2025-07-10 02:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 880, 'purchase', 'CA', 'dev18', '2025-07-10 02:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 1973, 'withdrawal', 'AU', 'dev14', '2025-07-10 02:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 3481, 'transfer', 'AU', 'dev13', '2025-07-10 02:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 8608, 'transfer', 'GB', 'dev8', '2025-07-10 02:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 16, 'withdrawal', 'CA', 'dev18', '2025-07-10 02:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 3430, 'withdrawal', 'AU', 'dev8', '2025-07-10 03:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 2220, 'withdrawal', 'AU', 'dev20', '2025-07-10 03:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 3788, 'withdrawal', 'US', 'dev15', '2025-07-10 03:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 9757, 'withdrawal', 'US', 'dev9', '2025-07-10 03:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 3473, 'transfer', 'US', 'dev1', '2025-07-10 03:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 6853, 'transfer', 'AU', 'dev17', '2025-07-10 03:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 6027, 'purchase', 'CA', 'dev8', '2025-07-10 03:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 6549, 'purchase', 'GB', 'dev14', '2025-07-10 03:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 977, 'purchase', 'GB', 'dev12', '2025-07-10 03:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 1608, 'withdrawal', 'US', 'dev3', '2025-07-10 03:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 7432, 'purchase', 'CA', 'dev12', '2025-07-10 03:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 4696, 'transfer', 'CA', 'dev20', '2025-07-10 03:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 7005, 'withdrawal', 'AU', 'dev15', '2025-07-10 03:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 3756, 'withdrawal', 'AU', 'dev13', '2025-07-10 03:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 9085, 'transfer', 'CA', 'dev1', '2025-07-10 03:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 3059, 'purchase', 'CA', 'dev3', '2025-07-10 03:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 6215, 'transfer', 'US', 'dev12', '2025-07-10 03:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 8064, 'withdrawal', 'US', 'dev4', '2025-07-10 03:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 5864, 'withdrawal', 'US', 'dev17', '2025-07-10 03:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 5848, 'withdrawal', 'US', 'dev1', '2025-07-10 03:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 9626, 'transfer', 'CA', 'dev2', '2025-07-10 03:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 6160, 'purchase', 'CA', 'dev12', '2025-07-10 03:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 8040, 'withdrawal', 'CA', 'dev7', '2025-07-10 03:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 4305, 'withdrawal', 'US', 'dev14', '2025-07-10 03:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 5288, 'withdrawal', 'GB', 'dev12', '2025-07-10 03:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 5316, 'transfer', 'US', 'dev3', '2025-07-10 03:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 5152, 'withdrawal', 'GB', 'dev20', '2025-07-10 03:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 1452, 'transfer', 'AU', 'dev2', '2025-07-10 03:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 83, 'purchase', 'AU', 'dev3', '2025-07-10 03:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 3166, 'transfer', 'GB', 'dev13', '2025-07-10 03:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 9750, 'purchase', 'US', 'dev14', '2025-07-10 03:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 3914, 'transfer', 'US', 'dev6', '2025-07-10 03:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 5040, 'withdrawal', 'CA', 'dev6', '2025-07-10 03:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 5629, 'withdrawal', 'GB', 'dev9', '2025-07-10 03:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 6810, 'purchase', 'AU', 'dev12', '2025-07-10 03:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 5729, 'purchase', 'AU', 'dev13', '2025-07-10 03:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 3283, 'withdrawal', 'GB', 'dev1', '2025-07-10 03:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 7818, 'withdrawal', 'GB', 'dev3', '2025-07-10 03:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 9770, 'withdrawal', 'CA', 'dev15', '2025-07-10 03:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 7197, 'transfer', 'US', 'dev16', '2025-07-10 03:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 7975, 'withdrawal', 'US', 'dev10', '2025-07-10 03:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 563, 'transfer', 'US', 'dev3', '2025-07-10 03:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 847, 'purchase', 'US', 'dev8', '2025-07-10 03:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 3381, 'transfer', 'CA', 'dev17', '2025-07-10 03:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 9232, 'withdrawal', 'US', 'dev5', '2025-07-10 03:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 7215, 'purchase', 'AU', 'dev7', '2025-07-10 03:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 496, 'withdrawal', 'GB', 'dev12', '2025-07-10 03:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 8395, 'purchase', 'CA', 'dev7', '2025-07-10 03:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 5932, 'withdrawal', 'US', 'dev13', '2025-07-10 03:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 3709, 'transfer', 'GB', 'dev11', '2025-07-10 03:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 1781, 'purchase', 'CA', 'dev3', '2025-07-10 03:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 5112, 'purchase', 'US', 'dev6', '2025-07-10 03:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 9884, 'purchase', 'AU', 'dev4', '2025-07-10 03:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 9729, 'purchase', 'US', 'dev2', '2025-07-10 03:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 8242, 'transfer', 'GB', 'dev11', '2025-07-10 03:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 7678, 'transfer', 'US', 'dev9', '2025-07-10 03:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 2361, 'transfer', 'CA', 'dev3', '2025-07-10 03:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 4193, 'purchase', 'GB', 'dev17', '2025-07-10 03:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 1863, 'transfer', 'AU', 'dev9', '2025-07-10 03:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 4545, 'transfer', 'CA', 'dev13', '2025-07-10 03:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 3434, 'purchase', 'AU', 'dev5', '2025-07-10 04:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 1972, 'transfer', 'AU', 'dev18', '2025-07-10 04:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 5123, 'transfer', 'AU', 'dev16', '2025-07-10 04:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 6521, 'purchase', 'CA', 'dev7', '2025-07-10 04:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 610, 'purchase', 'CA', 'dev18', '2025-07-10 04:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 4765, 'transfer', 'CA', 'dev4', '2025-07-10 04:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 7030, 'withdrawal', 'CA', 'dev18', '2025-07-10 04:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 3113, 'transfer', 'GB', 'dev18', '2025-07-10 04:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 1371, 'purchase', 'US', 'dev15', '2025-07-10 04:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 2341, 'purchase', 'CA', 'dev1', '2025-07-10 04:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 2341, 'withdrawal', 'AU', 'dev14', '2025-07-10 04:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 5566, 'transfer', 'CA', 'dev18', '2025-07-10 04:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 360, 'purchase', 'GB', 'dev14', '2025-07-10 04:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 9820, 'transfer', 'US', 'dev11', '2025-07-10 04:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 7222, 'purchase', 'CA', 'dev6', '2025-07-10 04:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 2947, 'purchase', 'GB', 'dev8', '2025-07-10 04:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 1397, 'purchase', 'CA', 'dev1', '2025-07-10 04:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 818, 'transfer', 'GB', 'dev13', '2025-07-10 04:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 2782, 'transfer', 'AU', 'dev7', '2025-07-10 04:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 4976, 'transfer', 'AU', 'dev7', '2025-07-10 04:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 8428, 'withdrawal', 'US', 'dev13', '2025-07-10 04:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 2234, 'transfer', 'CA', 'dev17', '2025-07-10 04:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 703, 'transfer', 'AU', 'dev14', '2025-07-10 04:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 5335, 'transfer', 'AU', 'dev1', '2025-07-10 04:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 8322, 'purchase', 'GB', 'dev5', '2025-07-10 04:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 6598, 'transfer', 'US', 'dev12', '2025-07-10 04:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 5156, 'transfer', 'AU', 'dev7', '2025-07-10 04:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 2213, 'withdrawal', 'CA', 'dev14', '2025-07-10 04:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 3488, 'purchase', 'US', 'dev8', '2025-07-10 04:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 3170, 'purchase', 'US', 'dev16', '2025-07-10 04:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 1296, 'withdrawal', 'AU', 'dev7', '2025-07-10 04:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 9254, 'purchase', 'GB', 'dev9', '2025-07-10 04:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 706, 'transfer', 'AU', 'dev18', '2025-07-10 04:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 7095, 'purchase', 'GB', 'dev14', '2025-07-10 04:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 8204, 'purchase', 'CA', 'dev1', '2025-07-10 04:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 1192, 'transfer', 'GB', 'dev12', '2025-07-10 04:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 2365, 'purchase', 'GB', 'dev8', '2025-07-10 04:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 6861, 'withdrawal', 'CA', 'dev6', '2025-07-10 04:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 3414, 'purchase', 'AU', 'dev5', '2025-07-10 04:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 3535, 'transfer', 'GB', 'dev13', '2025-07-10 04:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 9974, 'transfer', 'US', 'dev20', '2025-07-10 04:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 1505, 'purchase', 'GB', 'dev19', '2025-07-10 04:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 2603, 'withdrawal', 'US', 'dev4', '2025-07-10 04:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 9947, 'purchase', 'GB', 'dev14', '2025-07-10 04:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 5926, 'withdrawal', 'CA', 'dev17', '2025-07-10 04:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 7823, 'transfer', 'AU', 'dev5', '2025-07-10 04:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 7152, 'withdrawal', 'US', 'dev15', '2025-07-10 04:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (36, 4725, 'purchase', 'AU', 'dev18', '2025-07-10 04:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 3426, 'purchase', 'CA', 'dev15', '2025-07-10 04:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 4905, 'purchase', 'AU', 'dev12', '2025-07-10 04:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 8386, 'purchase', 'AU', 'dev19', '2025-07-10 04:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 9144, 'purchase', 'AU', 'dev12', '2025-07-10 04:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 4327, 'withdrawal', 'AU', 'dev13', '2025-07-10 04:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 1093, 'purchase', 'US', 'dev17', '2025-07-10 04:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 8889, 'transfer', 'AU', 'dev17', '2025-07-10 04:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 3173, 'withdrawal', 'CA', 'dev11', '2025-07-10 04:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 9213, 'transfer', 'GB', 'dev10', '2025-07-10 04:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 2954, 'withdrawal', 'AU', 'dev8', '2025-07-10 04:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 1226, 'transfer', 'GB', 'dev2', '2025-07-10 04:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (5, 5255, 'purchase', 'CA', 'dev20', '2025-07-10 04:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 3415, 'withdrawal', 'GB', 'dev5', '2025-07-10 05:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 1650, 'purchase', 'GB', 'dev8', '2025-07-10 05:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 54, 'purchase', 'CA', 'dev2', '2025-07-10 05:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 9212, 'transfer', 'US', 'dev6', '2025-07-10 05:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 5489, 'withdrawal', 'CA', 'dev16', '2025-07-10 05:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 5359, 'withdrawal', 'US', 'dev1', '2025-07-10 05:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 2725, 'purchase', 'AU', 'dev10', '2025-07-10 05:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 9009, 'transfer', 'AU', 'dev7', '2025-07-10 05:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 8840, 'transfer', 'US', 'dev10', '2025-07-10 05:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 4894, 'transfer', 'AU', 'dev14', '2025-07-10 05:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 4075, 'purchase', 'GB', 'dev4', '2025-07-10 05:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 3749, 'transfer', 'CA', 'dev11', '2025-07-10 05:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 2273, 'withdrawal', 'GB', 'dev20', '2025-07-10 05:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 2935, 'withdrawal', 'GB', 'dev11', '2025-07-10 05:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 482, 'transfer', 'AU', 'dev18', '2025-07-10 05:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 5436, 'withdrawal', 'CA', 'dev6', '2025-07-10 05:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 9455, 'withdrawal', 'AU', 'dev18', '2025-07-10 05:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 5260, 'transfer', 'GB', 'dev4', '2025-07-10 05:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 7572, 'purchase', 'AU', 'dev14', '2025-07-10 05:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 7588, 'transfer', 'US', 'dev5', '2025-07-10 05:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 2007, 'withdrawal', 'CA', 'dev14', '2025-07-10 05:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 199, 'withdrawal', 'GB', 'dev1', '2025-07-10 05:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 362, 'purchase', 'GB', 'dev11', '2025-07-10 05:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 8039, 'purchase', 'GB', 'dev17', '2025-07-10 05:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 2506, 'withdrawal', 'AU', 'dev18', '2025-07-10 05:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 9337, 'transfer', 'GB', 'dev15', '2025-07-10 05:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 3571, 'withdrawal', 'AU', 'dev20', '2025-07-10 05:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 4222, 'withdrawal', 'GB', 'dev10', '2025-07-10 05:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 811, 'purchase', 'CA', 'dev6', '2025-07-10 05:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 7429, 'transfer', 'AU', 'dev7', '2025-07-10 05:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 8099, 'transfer', 'US', 'dev19', '2025-07-10 05:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 4720, 'transfer', 'US', 'dev18', '2025-07-10 05:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 7218, 'purchase', 'AU', 'dev8', '2025-07-10 05:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 8384, 'withdrawal', 'AU', 'dev4', '2025-07-10 05:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 2890, 'withdrawal', 'US', 'dev15', '2025-07-10 05:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 9973, 'withdrawal', 'AU', 'dev13', '2025-07-10 05:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 1159, 'transfer', 'AU', 'dev10', '2025-07-10 05:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 8224, 'purchase', 'CA', 'dev16', '2025-07-10 05:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 3754, 'purchase', 'AU', 'dev13', '2025-07-10 05:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 6275, 'purchase', 'GB', 'dev14', '2025-07-10 05:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 3194, 'transfer', 'GB', 'dev12', '2025-07-10 05:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 7120, 'transfer', 'AU', 'dev10', '2025-07-10 05:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 66, 'transfer', 'GB', 'dev16', '2025-07-10 05:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 1120, 'transfer', 'CA', 'dev10', '2025-07-10 05:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 8076, 'withdrawal', 'GB', 'dev7', '2025-07-10 05:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 2057, 'purchase', 'GB', 'dev17', '2025-07-10 05:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 794, 'withdrawal', 'US', 'dev9', '2025-07-10 05:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 7028, 'withdrawal', 'AU', 'dev10', '2025-07-10 05:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 9715, 'transfer', 'GB', 'dev19', '2025-07-10 05:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 5144, 'withdrawal', 'GB', 'dev2', '2025-07-10 05:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 7083, 'purchase', 'CA', 'dev13', '2025-07-10 05:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 1373, 'purchase', 'CA', 'dev2', '2025-07-10 05:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 4503, 'purchase', 'CA', 'dev7', '2025-07-10 05:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 652, 'purchase', 'AU', 'dev13', '2025-07-10 05:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 1727, 'purchase', 'CA', 'dev7', '2025-07-10 05:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 3593, 'transfer', 'CA', 'dev9', '2025-07-10 05:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 6880, 'transfer', 'GB', 'dev9', '2025-07-10 05:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 4719, 'purchase', 'AU', 'dev11', '2025-07-10 05:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 8346, 'transfer', 'GB', 'dev6', '2025-07-10 05:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (5, 6199, 'transfer', 'CA', 'dev13', '2025-07-10 05:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 6735, 'transfer', 'CA', 'dev8', '2025-07-10 06:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 8186, 'purchase', 'US', 'dev7', '2025-07-10 06:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 8150, 'transfer', 'CA', 'dev3', '2025-07-10 06:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 2720, 'transfer', 'GB', 'dev20', '2025-07-10 06:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 2648, 'transfer', 'GB', 'dev6', '2025-07-10 06:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 5366, 'withdrawal', 'AU', 'dev10', '2025-07-10 06:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 1333, 'transfer', 'US', 'dev13', '2025-07-10 06:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 6024, 'transfer', 'GB', 'dev5', '2025-07-10 06:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 4192, 'purchase', 'GB', 'dev4', '2025-07-10 06:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 1938, 'transfer', 'GB', 'dev18', '2025-07-10 06:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 4182, 'purchase', 'CA', 'dev17', '2025-07-10 06:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 2243, 'withdrawal', 'GB', 'dev14', '2025-07-10 06:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 4091, 'purchase', 'GB', 'dev20', '2025-07-10 06:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 8450, 'withdrawal', 'AU', 'dev11', '2025-07-10 06:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 3236, 'transfer', 'GB', 'dev1', '2025-07-10 06:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 8274, 'transfer', 'GB', 'dev5', '2025-07-10 06:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 657, 'transfer', 'CA', 'dev12', '2025-07-10 06:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 1244, 'withdrawal', 'GB', 'dev12', '2025-07-10 06:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 8311, 'withdrawal', 'US', 'dev5', '2025-07-10 06:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 1923, 'purchase', 'US', 'dev10', '2025-07-10 06:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 4988, 'purchase', 'AU', 'dev19', '2025-07-10 06:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 7854, 'transfer', 'US', 'dev2', '2025-07-10 06:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 5849, 'withdrawal', 'US', 'dev9', '2025-07-10 06:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 6422, 'withdrawal', 'CA', 'dev7', '2025-07-10 06:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 1143, 'withdrawal', 'AU', 'dev8', '2025-07-10 06:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 756, 'purchase', 'GB', 'dev2', '2025-07-10 06:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 7342, 'purchase', 'CA', 'dev12', '2025-07-10 06:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 5991, 'purchase', 'US', 'dev8', '2025-07-10 06:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 4596, 'withdrawal', 'CA', 'dev4', '2025-07-10 06:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 338, 'withdrawal', 'CA', 'dev1', '2025-07-10 06:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 9171, 'withdrawal', 'CA', 'dev1', '2025-07-10 06:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 7173, 'transfer', 'AU', 'dev11', '2025-07-10 06:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 8970, 'purchase', 'AU', 'dev4', '2025-07-10 06:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 32, 'withdrawal', 'AU', 'dev1', '2025-07-10 06:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 9257, 'transfer', 'US', 'dev18', '2025-07-10 06:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 7674, 'purchase', 'US', 'dev6', '2025-07-10 06:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 4591, 'withdrawal', 'US', 'dev20', '2025-07-10 06:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 7006, 'withdrawal', 'CA', 'dev1', '2025-07-10 06:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 7326, 'purchase', 'CA', 'dev14', '2025-07-10 06:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 9983, 'purchase', 'AU', 'dev19', '2025-07-10 06:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 5013, 'withdrawal', 'US', 'dev16', '2025-07-10 06:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 30, 'transfer', 'AU', 'dev8', '2025-07-10 06:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 2183, 'withdrawal', 'GB', 'dev2', '2025-07-10 06:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 2403, 'purchase', 'CA', 'dev19', '2025-07-10 06:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 673, 'transfer', 'US', 'dev7', '2025-07-10 06:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 1738, 'purchase', 'GB', 'dev15', '2025-07-10 06:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 2406, 'transfer', 'GB', 'dev15', '2025-07-10 06:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 5312, 'purchase', 'US', 'dev9', '2025-07-10 06:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 2464, 'purchase', 'CA', 'dev8', '2025-07-10 06:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 3392, 'withdrawal', 'CA', 'dev4', '2025-07-10 06:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 966, 'transfer', 'AU', 'dev11', '2025-07-10 06:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 3042, 'purchase', 'GB', 'dev12', '2025-07-10 06:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 8048, 'purchase', 'US', 'dev11', '2025-07-10 06:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 3561, 'transfer', 'US', 'dev9', '2025-07-10 06:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 7993, 'withdrawal', 'US', 'dev9', '2025-07-10 06:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 6332, 'transfer', 'US', 'dev3', '2025-07-10 06:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 3537, 'transfer', 'GB', 'dev7', '2025-07-10 06:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 9956, 'withdrawal', 'US', 'dev2', '2025-07-10 06:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 3915, 'purchase', 'CA', 'dev9', '2025-07-10 06:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 8236, 'withdrawal', 'US', 'dev4', '2025-07-10 06:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 4519, 'withdrawal', 'AU', 'dev9', '2025-07-10 07:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 8656, 'purchase', 'AU', 'dev4', '2025-07-10 07:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 9189, 'withdrawal', 'US', 'dev6', '2025-07-10 07:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 1329, 'purchase', 'GB', 'dev19', '2025-07-10 07:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 8786, 'withdrawal', 'CA', 'dev18', '2025-07-10 07:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 8283, 'purchase', 'US', 'dev11', '2025-07-10 07:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 6531, 'transfer', 'GB', 'dev11', '2025-07-10 07:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 9010, 'purchase', 'CA', 'dev13', '2025-07-10 07:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 4103, 'transfer', 'AU', 'dev2', '2025-07-10 07:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 4869, 'withdrawal', 'AU', 'dev13', '2025-07-10 07:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 5012, 'transfer', 'GB', 'dev4', '2025-07-10 07:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (5, 847, 'withdrawal', 'AU', 'dev18', '2025-07-10 07:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 5275, 'withdrawal', 'AU', 'dev19', '2025-07-10 07:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 8199, 'transfer', 'AU', 'dev4', '2025-07-10 07:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 5148, 'purchase', 'GB', 'dev16', '2025-07-10 07:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 6359, 'transfer', 'AU', 'dev16', '2025-07-10 07:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 2293, 'purchase', 'US', 'dev6', '2025-07-10 07:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 4069, 'purchase', 'US', 'dev2', '2025-07-10 07:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 5738, 'purchase', 'AU', 'dev9', '2025-07-10 07:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 2631, 'withdrawal', 'US', 'dev18', '2025-07-10 07:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 9852, 'withdrawal', 'CA', 'dev6', '2025-07-10 07:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 9326, 'withdrawal', 'US', 'dev19', '2025-07-10 07:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 2291, 'purchase', 'US', 'dev6', '2025-07-10 07:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 3035, 'purchase', 'GB', 'dev9', '2025-07-10 07:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 1295, 'transfer', 'AU', 'dev3', '2025-07-10 07:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 3938, 'transfer', 'US', 'dev2', '2025-07-10 07:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 9017, 'purchase', 'US', 'dev20', '2025-07-10 07:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 4357, 'purchase', 'GB', 'dev15', '2025-07-10 07:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 2434, 'transfer', 'GB', 'dev20', '2025-07-10 07:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 1386, 'withdrawal', 'US', 'dev9', '2025-07-10 07:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 3285, 'withdrawal', 'CA', 'dev7', '2025-07-10 07:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 9355, 'withdrawal', 'US', 'dev7', '2025-07-10 07:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 3605, 'transfer', 'GB', 'dev8', '2025-07-10 07:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 5486, 'withdrawal', 'US', 'dev4', '2025-07-10 07:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 9072, 'transfer', 'AU', 'dev7', '2025-07-10 07:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 583, 'withdrawal', 'US', 'dev5', '2025-07-10 07:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 220, 'purchase', 'CA', 'dev5', '2025-07-10 07:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 3478, 'withdrawal', 'US', 'dev8', '2025-07-10 07:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 4185, 'purchase', 'CA', 'dev6', '2025-07-10 07:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 9327, 'withdrawal', 'GB', 'dev3', '2025-07-10 07:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 9994, 'transfer', 'AU', 'dev15', '2025-07-10 07:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 9031, 'withdrawal', 'CA', 'dev5', '2025-07-10 07:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 3121, 'transfer', 'CA', 'dev6', '2025-07-10 07:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 8391, 'purchase', 'US', 'dev5', '2025-07-10 07:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 8057, 'purchase', 'GB', 'dev18', '2025-07-10 07:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 7066, 'purchase', 'GB', 'dev4', '2025-07-10 07:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 8784, 'withdrawal', 'AU', 'dev19', '2025-07-10 07:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 4869, 'transfer', 'CA', 'dev14', '2025-07-10 07:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 9409, 'withdrawal', 'US', 'dev15', '2025-07-10 07:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 9971, 'withdrawal', 'AU', 'dev18', '2025-07-10 07:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 9192, 'purchase', 'GB', 'dev10', '2025-07-10 07:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 7753, 'purchase', 'AU', 'dev20', '2025-07-10 07:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 635, 'withdrawal', 'GB', 'dev5', '2025-07-10 07:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 5165, 'withdrawal', 'CA', 'dev17', '2025-07-10 07:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 8205, 'withdrawal', 'AU', 'dev15', '2025-07-10 07:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 302, 'withdrawal', 'AU', 'dev16', '2025-07-10 07:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 2195, 'purchase', 'AU', 'dev19', '2025-07-10 07:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 404, 'transfer', 'GB', 'dev10', '2025-07-10 07:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 382, 'purchase', 'GB', 'dev7', '2025-07-10 07:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 4904, 'transfer', 'US', 'dev15', '2025-07-10 07:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 7199, 'withdrawal', 'US', 'dev18', '2025-07-10 08:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 897, 'withdrawal', 'AU', 'dev13', '2025-07-10 08:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 4361, 'purchase', 'AU', 'dev1', '2025-07-10 08:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 1367, 'purchase', 'AU', 'dev14', '2025-07-10 08:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 8386, 'transfer', 'AU', 'dev5', '2025-07-10 08:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 8061, 'withdrawal', 'CA', 'dev15', '2025-07-10 08:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 8096, 'purchase', 'AU', 'dev10', '2025-07-10 08:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 4485, 'transfer', 'US', 'dev20', '2025-07-10 08:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 7300, 'transfer', 'GB', 'dev16', '2025-07-10 08:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 8873, 'purchase', 'AU', 'dev16', '2025-07-10 08:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 8223, 'transfer', 'GB', 'dev10', '2025-07-10 08:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 9905, 'withdrawal', 'AU', 'dev11', '2025-07-10 08:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 2430, 'transfer', 'GB', 'dev17', '2025-07-10 08:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 5823, 'transfer', 'CA', 'dev2', '2025-07-10 08:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 1133, 'withdrawal', 'CA', 'dev9', '2025-07-10 08:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 822, 'transfer', 'AU', 'dev14', '2025-07-10 08:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 7703, 'transfer', 'CA', 'dev4', '2025-07-10 08:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 91, 'transfer', 'GB', 'dev6', '2025-07-10 08:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 5511, 'withdrawal', 'CA', 'dev19', '2025-07-10 08:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 8899, 'purchase', 'CA', 'dev15', '2025-07-10 08:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 3052, 'withdrawal', 'CA', 'dev11', '2025-07-10 08:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 6257, 'transfer', 'US', 'dev7', '2025-07-10 08:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 6129, 'transfer', 'US', 'dev11', '2025-07-10 08:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 8936, 'purchase', 'GB', 'dev19', '2025-07-10 08:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 2495, 'transfer', 'CA', 'dev1', '2025-07-10 08:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 7594, 'transfer', 'GB', 'dev7', '2025-07-10 08:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 9847, 'transfer', 'AU', 'dev4', '2025-07-10 08:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 6328, 'withdrawal', 'US', 'dev5', '2025-07-10 08:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 6289, 'purchase', 'US', 'dev1', '2025-07-10 08:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 9773, 'transfer', 'US', 'dev13', '2025-07-10 08:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 185, 'purchase', 'GB', 'dev6', '2025-07-10 08:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 4231, 'purchase', 'CA', 'dev14', '2025-07-10 08:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 7297, 'purchase', 'AU', 'dev4', '2025-07-10 08:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 5954, 'purchase', 'US', 'dev1', '2025-07-10 08:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 7376, 'transfer', 'CA', 'dev1', '2025-07-10 08:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 677, 'withdrawal', 'CA', 'dev3', '2025-07-10 08:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 3474, 'transfer', 'GB', 'dev18', '2025-07-10 08:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 7401, 'transfer', 'GB', 'dev9', '2025-07-10 08:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 6164, 'purchase', 'AU', 'dev1', '2025-07-10 08:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 5340, 'withdrawal', 'US', 'dev7', '2025-07-10 08:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 8490, 'purchase', 'GB', 'dev8', '2025-07-10 08:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 3677, 'transfer', 'GB', 'dev17', '2025-07-10 08:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 2328, 'withdrawal', 'US', 'dev17', '2025-07-10 08:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (12, 2731, 'withdrawal', 'AU', 'dev18', '2025-07-10 08:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 4442, 'transfer', 'AU', 'dev10', '2025-07-10 08:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 6795, 'transfer', 'CA', 'dev14', '2025-07-10 08:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 4977, 'purchase', 'GB', 'dev19', '2025-07-10 08:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 9524, 'withdrawal', 'CA', 'dev11', '2025-07-10 08:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 7988, 'purchase', 'US', 'dev19', '2025-07-10 08:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 1167, 'purchase', 'US', 'dev19', '2025-07-10 08:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 5271, 'purchase', 'US', 'dev3', '2025-07-10 08:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 4784, 'purchase', 'CA', 'dev19', '2025-07-10 08:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 7138, 'transfer', 'CA', 'dev8', '2025-07-10 08:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 9832, 'purchase', 'US', 'dev2', '2025-07-10 08:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 4503, 'withdrawal', 'AU', 'dev14', '2025-07-10 08:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 4528, 'withdrawal', 'CA', 'dev15', '2025-07-10 08:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 4906, 'withdrawal', 'AU', 'dev8', '2025-07-10 08:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 5949, 'withdrawal', 'AU', 'dev19', '2025-07-10 08:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 8535, 'withdrawal', 'GB', 'dev12', '2025-07-10 08:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 2744, 'withdrawal', 'US', 'dev1', '2025-07-10 08:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 1055, 'transfer', 'CA', 'dev7', '2025-07-10 09:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 3835, 'withdrawal', 'AU', 'dev7', '2025-07-10 09:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 5735, 'transfer', 'AU', 'dev14', '2025-07-10 09:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 6702, 'purchase', 'CA', 'dev4', '2025-07-10 09:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 8584, 'transfer', 'GB', 'dev13', '2025-07-10 09:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 6415, 'withdrawal', 'AU', 'dev15', '2025-07-10 09:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 187, 'purchase', 'GB', 'dev10', '2025-07-10 09:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 5208, 'purchase', 'CA', 'dev3', '2025-07-10 09:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 8038, 'purchase', 'CA', 'dev13', '2025-07-10 09:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 8847, 'purchase', 'CA', 'dev13', '2025-07-10 09:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 5498, 'withdrawal', 'CA', 'dev19', '2025-07-10 09:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 4479, 'withdrawal', 'GB', 'dev1', '2025-07-10 09:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 2431, 'purchase', 'GB', 'dev9', '2025-07-10 09:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 1167, 'withdrawal', 'AU', 'dev11', '2025-07-10 09:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 6650, 'purchase', 'CA', 'dev20', '2025-07-10 09:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 8533, 'purchase', 'CA', 'dev18', '2025-07-10 09:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 7296, 'transfer', 'GB', 'dev13', '2025-07-10 09:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 1800, 'transfer', 'AU', 'dev20', '2025-07-10 09:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 34, 'withdrawal', 'AU', 'dev13', '2025-07-10 09:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 7212, 'withdrawal', 'US', 'dev19', '2025-07-10 09:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 4013, 'transfer', 'GB', 'dev1', '2025-07-10 09:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 5539, 'purchase', 'AU', 'dev7', '2025-07-10 09:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 519, 'purchase', 'GB', 'dev12', '2025-07-10 09:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 1054, 'purchase', 'CA', 'dev12', '2025-07-10 09:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 8072, 'transfer', 'AU', 'dev14', '2025-07-10 09:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 7647, 'withdrawal', 'AU', 'dev10', '2025-07-10 09:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 4099, 'withdrawal', 'AU', 'dev19', '2025-07-10 09:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 6950, 'transfer', 'CA', 'dev6', '2025-07-10 09:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 9824, 'transfer', 'GB', 'dev12', '2025-07-10 09:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 7092, 'transfer', 'CA', 'dev12', '2025-07-10 09:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 2036, 'withdrawal', 'US', 'dev6', '2025-07-10 09:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 1993, 'transfer', 'US', 'dev15', '2025-07-10 09:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 6544, 'purchase', 'GB', 'dev8', '2025-07-10 09:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 2005, 'transfer', 'CA', 'dev11', '2025-07-10 09:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 4059, 'withdrawal', 'US', 'dev2', '2025-07-10 09:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 2001, 'withdrawal', 'CA', 'dev8', '2025-07-10 09:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 4843, 'purchase', 'GB', 'dev9', '2025-07-10 09:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 2451, 'purchase', 'US', 'dev17', '2025-07-10 09:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 5601, 'transfer', 'GB', 'dev5', '2025-07-10 09:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 9029, 'purchase', 'CA', 'dev16', '2025-07-10 09:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 2426, 'purchase', 'US', 'dev1', '2025-07-10 09:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (36, 6098, 'withdrawal', 'CA', 'dev14', '2025-07-10 09:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 1183, 'withdrawal', 'AU', 'dev11', '2025-07-10 09:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 2293, 'purchase', 'AU', 'dev20', '2025-07-10 09:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 4885, 'purchase', 'GB', 'dev12', '2025-07-10 09:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 5051, 'purchase', 'US', 'dev5', '2025-07-10 09:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 171, 'transfer', 'GB', 'dev12', '2025-07-10 09:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 2997, 'transfer', 'AU', 'dev19', '2025-07-10 09:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 8007, 'purchase', 'US', 'dev19', '2025-07-10 09:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 9670, 'purchase', 'CA', 'dev4', '2025-07-10 09:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (36, 7536, 'transfer', 'GB', 'dev19', '2025-07-10 09:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 8624, 'withdrawal', 'US', 'dev16', '2025-07-10 09:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 9391, 'purchase', 'GB', 'dev3', '2025-07-10 09:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 184, 'transfer', 'US', 'dev16', '2025-07-10 09:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 1479, 'transfer', 'US', 'dev17', '2025-07-10 09:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 4411, 'transfer', 'GB', 'dev15', '2025-07-10 09:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 5736, 'withdrawal', 'GB', 'dev12', '2025-07-10 09:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 3504, 'purchase', 'GB', 'dev9', '2025-07-10 09:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 6756, 'purchase', 'GB', 'dev4', '2025-07-10 09:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (14, 2036, 'withdrawal', 'CA', 'dev18', '2025-07-10 09:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 4893, 'purchase', 'US', 'dev13', '2025-07-10 10:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 5093, 'withdrawal', 'US', 'dev2', '2025-07-10 10:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 6055, 'transfer', 'GB', 'dev14', '2025-07-10 10:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 7068, 'purchase', 'AU', 'dev13', '2025-07-10 10:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 8201, 'transfer', 'US', 'dev20', '2025-07-10 10:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 8385, 'withdrawal', 'AU', 'dev14', '2025-07-10 10:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 9106, 'purchase', 'US', 'dev9', '2025-07-10 10:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 464, 'transfer', 'AU', 'dev8', '2025-07-10 10:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 4488, 'withdrawal', 'CA', 'dev20', '2025-07-10 10:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 9968, 'transfer', 'US', 'dev7', '2025-07-10 10:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 9499, 'transfer', 'AU', 'dev1', '2025-07-10 10:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 9445, 'purchase', 'US', 'dev10', '2025-07-10 10:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 8514, 'transfer', 'US', 'dev10', '2025-07-10 10:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 4449, 'purchase', 'AU', 'dev6', '2025-07-10 10:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 3752, 'purchase', 'US', 'dev9', '2025-07-10 10:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 107, 'withdrawal', 'US', 'dev7', '2025-07-10 10:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (5, 5525, 'transfer', 'US', 'dev12', '2025-07-10 10:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 50, 'withdrawal', 'CA', 'dev13', '2025-07-10 10:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 3288, 'purchase', 'AU', 'dev13', '2025-07-10 10:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 7859, 'withdrawal', 'US', 'dev10', '2025-07-10 10:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 1130, 'transfer', 'AU', 'dev19', '2025-07-10 10:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 2712, 'transfer', 'AU', 'dev13', '2025-07-10 10:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 7626, 'withdrawal', 'CA', 'dev10', '2025-07-10 10:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 3289, 'purchase', 'AU', 'dev17', '2025-07-10 10:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 9060, 'transfer', 'AU', 'dev14', '2025-07-10 10:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 8446, 'withdrawal', 'GB', 'dev8', '2025-07-10 10:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 2264, 'purchase', 'US', 'dev8', '2025-07-10 10:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 7572, 'purchase', 'GB', 'dev19', '2025-07-10 10:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 180, 'purchase', 'AU', 'dev6', '2025-07-10 10:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 9401, 'withdrawal', 'CA', 'dev4', '2025-07-10 10:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 8539, 'purchase', 'GB', 'dev2', '2025-07-10 10:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 6533, 'withdrawal', 'AU', 'dev6', '2025-07-10 10:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 8637, 'transfer', 'CA', 'dev20', '2025-07-10 10:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 2720, 'transfer', 'GB', 'dev16', '2025-07-10 10:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 6984, 'withdrawal', 'CA', 'dev17', '2025-07-10 10:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 118, 'withdrawal', 'AU', 'dev8', '2025-07-10 10:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 749, 'transfer', 'US', 'dev20', '2025-07-10 10:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 8816, 'withdrawal', 'CA', 'dev14', '2025-07-10 10:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 7403, 'withdrawal', 'AU', 'dev19', '2025-07-10 10:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 7125, 'purchase', 'AU', 'dev6', '2025-07-10 10:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 7040, 'purchase', 'US', 'dev10', '2025-07-10 10:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 708, 'withdrawal', 'GB', 'dev15', '2025-07-10 10:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 2147, 'transfer', 'US', 'dev19', '2025-07-10 10:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 5926, 'purchase', 'GB', 'dev15', '2025-07-10 10:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 4717, 'withdrawal', 'CA', 'dev8', '2025-07-10 10:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 2025, 'purchase', 'GB', 'dev9', '2025-07-10 10:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 3971, 'withdrawal', 'AU', 'dev2', '2025-07-10 10:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 4940, 'transfer', 'US', 'dev1', '2025-07-10 10:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 6426, 'withdrawal', 'US', 'dev16', '2025-07-10 10:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 6902, 'purchase', 'GB', 'dev5', '2025-07-10 10:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 7808, 'transfer', 'US', 'dev6', '2025-07-10 10:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 5661, 'purchase', 'AU', 'dev14', '2025-07-10 10:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 860, 'purchase', 'GB', 'dev8', '2025-07-10 10:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (10, 4522, 'transfer', 'AU', 'dev7', '2025-07-10 10:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 6010, 'purchase', 'GB', 'dev12', '2025-07-10 10:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 6356, 'transfer', 'AU', 'dev5', '2025-07-10 10:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 4477, 'purchase', 'CA', 'dev15', '2025-07-10 10:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 2318, 'transfer', 'US', 'dev16', '2025-07-10 10:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 6978, 'purchase', 'CA', 'dev13', '2025-07-10 10:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 7586, 'withdrawal', 'US', 'dev12', '2025-07-10 10:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 3116, 'withdrawal', 'GB', 'dev16', '2025-07-10 11:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 2839, 'purchase', 'GB', 'dev5', '2025-07-10 11:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 6323, 'withdrawal', 'CA', 'dev6', '2025-07-10 11:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 2897, 'transfer', 'GB', 'dev2', '2025-07-10 11:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 4228, 'purchase', 'US', 'dev19', '2025-07-10 11:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 2247, 'purchase', 'AU', 'dev5', '2025-07-10 11:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 2802, 'purchase', 'US', 'dev7', '2025-07-10 11:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 1149, 'withdrawal', 'AU', 'dev2', '2025-07-10 11:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 5614, 'purchase', 'US', 'dev2', '2025-07-10 11:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 8746, 'transfer', 'AU', 'dev4', '2025-07-10 11:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 3573, 'transfer', 'AU', 'dev17', '2025-07-10 11:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 3087, 'withdrawal', 'CA', 'dev3', '2025-07-10 11:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 8662, 'purchase', 'US', 'dev16', '2025-07-10 11:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 2139, 'withdrawal', 'US', 'dev3', '2025-07-10 11:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 1169, 'purchase', 'GB', 'dev5', '2025-07-10 11:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 8568, 'purchase', 'AU', 'dev13', '2025-07-10 11:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 9334, 'withdrawal', 'US', 'dev4', '2025-07-10 11:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 9162, 'purchase', 'AU', 'dev18', '2025-07-10 11:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 1855, 'transfer', 'US', 'dev19', '2025-07-10 11:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 1657, 'withdrawal', 'US', 'dev19', '2025-07-10 11:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 9919, 'transfer', 'AU', 'dev10', '2025-07-10 11:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 9437, 'transfer', 'US', 'dev16', '2025-07-10 11:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 2219, 'purchase', 'AU', 'dev14', '2025-07-10 11:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (38, 5136, 'purchase', 'US', 'dev7', '2025-07-10 11:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 9390, 'purchase', 'CA', 'dev15', '2025-07-10 11:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 732, 'purchase', 'CA', 'dev20', '2025-07-10 11:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 1951, 'transfer', 'CA', 'dev5', '2025-07-10 11:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 5820, 'purchase', 'GB', 'dev8', '2025-07-10 11:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (21, 9397, 'withdrawal', 'US', 'dev4', '2025-07-10 11:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 6487, 'purchase', 'US', 'dev11', '2025-07-10 11:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 4751, 'transfer', 'US', 'dev9', '2025-07-10 11:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 4418, 'purchase', 'GB', 'dev12', '2025-07-10 11:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 9799, 'purchase', 'US', 'dev20', '2025-07-10 11:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 3318, 'transfer', 'CA', 'dev13', '2025-07-10 11:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (30, 9981, 'transfer', 'US', 'dev5', '2025-07-10 11:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 7477, 'transfer', 'GB', 'dev11', '2025-07-10 11:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 9651, 'transfer', 'GB', 'dev9', '2025-07-10 11:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (47, 788, 'withdrawal', 'CA', 'dev5', '2025-07-10 11:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 7338, 'withdrawal', 'CA', 'dev14', '2025-07-10 11:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 3459, 'purchase', 'US', 'dev4', '2025-07-10 11:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 6847, 'purchase', 'AU', 'dev11', '2025-07-10 11:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 5042, 'transfer', 'CA', 'dev4', '2025-07-10 11:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (35, 4852, 'transfer', 'GB', 'dev15', '2025-07-10 11:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 405, 'withdrawal', 'AU', 'dev16', '2025-07-10 11:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 3149, 'purchase', 'US', 'dev11', '2025-07-10 11:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 9108, 'transfer', 'CA', 'dev6', '2025-07-10 11:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 9946, 'purchase', 'CA', 'dev12', '2025-07-10 11:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 8768, 'purchase', 'CA', 'dev11', '2025-07-10 11:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (26, 2565, 'withdrawal', 'AU', 'dev1', '2025-07-10 11:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 686, 'withdrawal', 'CA', 'dev9', '2025-07-10 11:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 9515, 'transfer', 'CA', 'dev18', '2025-07-10 11:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (34, 7534, 'transfer', 'US', 'dev13', '2025-07-10 11:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (36, 3853, 'withdrawal', 'CA', 'dev2', '2025-07-10 11:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 8511, 'purchase', 'AU', 'dev18', '2025-07-10 11:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 1900, 'transfer', 'CA', 'dev1', '2025-07-10 11:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 8230, 'withdrawal', 'US', 'dev16', '2025-07-10 11:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 2814, 'purchase', 'US', 'dev19', '2025-07-10 11:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (42, 6475, 'withdrawal', 'US', 'dev4', '2025-07-10 11:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 6467, 'transfer', 'GB', 'dev3', '2025-07-10 11:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 8938, 'transfer', 'AU', 'dev18', '2025-07-10 11:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 8235, 'transfer', 'AU', 'dev4', '2025-07-10 12:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 5842, 'withdrawal', 'AU', 'dev18', '2025-07-10 12:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (48, 9250, 'transfer', 'US', 'dev18', '2025-07-10 12:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 976, 'purchase', 'AU', 'dev17', '2025-07-10 12:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 6340, 'transfer', 'GB', 'dev7', '2025-07-10 12:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 6730, 'transfer', 'AU', 'dev4', '2025-07-10 12:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 159, 'transfer', 'US', 'dev16', '2025-07-10 12:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 993, 'transfer', 'US', 'dev9', '2025-07-10 12:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (15, 9849, 'withdrawal', 'US', 'dev9', '2025-07-10 12:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 4037, 'withdrawal', 'US', 'dev3', '2025-07-10 12:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 854, 'withdrawal', 'US', 'dev2', '2025-07-10 12:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 1379, 'withdrawal', 'US', 'dev13', '2025-07-10 12:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (11, 3831, 'withdrawal', 'US', 'dev3', '2025-07-10 12:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 9413, 'withdrawal', 'GB', 'dev7', '2025-07-10 12:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (29, 1584, 'withdrawal', 'US', 'dev4', '2025-07-10 12:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 6217, 'withdrawal', 'US', 'dev13', '2025-07-10 12:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 2998, 'withdrawal', 'US', 'dev10', '2025-07-10 12:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 7461, 'transfer', 'US', 'dev4', '2025-07-10 12:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 2602, 'withdrawal', 'AU', 'dev4', '2025-07-10 12:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 9396, 'transfer', 'US', 'dev10', '2025-07-10 12:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (31, 5784, 'withdrawal', 'CA', 'dev14', '2025-07-10 12:20:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (5, 1318, 'purchase', 'CA', 'dev8', '2025-07-10 12:21:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 5532, 'purchase', 'GB', 'dev1', '2025-07-10 12:22:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 542, 'withdrawal', 'GB', 'dev12', '2025-07-10 12:23:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 8911, 'transfer', 'CA', 'dev13', '2025-07-10 12:24:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 976, 'transfer', 'US', 'dev6', '2025-07-10 12:25:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (7, 4400, 'withdrawal', 'US', 'dev1', '2025-07-10 12:26:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 9502, 'withdrawal', 'CA', 'dev19', '2025-07-10 12:27:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 9591, 'purchase', 'CA', 'dev10', '2025-07-10 12:28:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 5040, 'withdrawal', 'AU', 'dev20', '2025-07-10 12:29:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (40, 8101, 'transfer', 'US', 'dev14', '2025-07-10 12:30:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 6126, 'purchase', 'GB', 'dev3', '2025-07-10 12:31:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 7165, 'withdrawal', 'US', 'dev19', '2025-07-10 12:32:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 6433, 'purchase', 'CA', 'dev1', '2025-07-10 12:33:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 5997, 'withdrawal', 'AU', 'dev20', '2025-07-10 12:34:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 3733, 'withdrawal', 'CA', 'dev12', '2025-07-10 12:35:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 4703, 'transfer', 'GB', 'dev5', '2025-07-10 12:36:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (16, 4120, 'withdrawal', 'US', 'dev17', '2025-07-10 12:37:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (1, 3219, 'purchase', 'GB', 'dev7', '2025-07-10 12:38:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (33, 1165, 'transfer', 'AU', 'dev20', '2025-07-10 12:39:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (18, 8893, 'withdrawal', 'US', 'dev10', '2025-07-10 12:40:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (44, 5228, 'purchase', 'US', 'dev6', '2025-07-10 12:41:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (19, 5028, 'withdrawal', 'US', 'dev19', '2025-07-10 12:42:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 6420, 'withdrawal', 'GB', 'dev6', '2025-07-10 12:43:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (3, 4959, 'purchase', 'CA', 'dev20', '2025-07-10 12:44:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 1491, 'purchase', 'GB', 'dev19', '2025-07-10 12:45:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 7732, 'transfer', 'AU', 'dev16', '2025-07-10 12:46:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (22, 54, 'purchase', 'CA', 'dev9', '2025-07-10 12:47:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 5046, 'transfer', 'AU', 'dev6', '2025-07-10 12:48:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 410, 'purchase', 'US', 'dev11', '2025-07-10 12:49:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (46, 2784, 'withdrawal', 'CA', 'dev13', '2025-07-10 12:50:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (9, 2085, 'transfer', 'AU', 'dev12', '2025-07-10 12:51:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 5859, 'transfer', 'CA', 'dev1', '2025-07-10 12:52:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (49, 9210, 'purchase', 'US', 'dev1', '2025-07-10 12:53:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 7451, 'transfer', 'US', 'dev9', '2025-07-10 12:54:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (28, 4442, 'withdrawal', 'AU', 'dev3', '2025-07-10 12:55:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 5508, 'purchase', 'GB', 'dev6', '2025-07-10 12:56:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 7060, 'purchase', 'US', 'dev15', '2025-07-10 12:57:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 696, 'transfer', 'GB', 'dev13', '2025-07-10 12:58:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (43, 6588, 'withdrawal', 'AU', 'dev7', '2025-07-10 12:59:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 2258, 'transfer', 'GB', 'dev11', '2025-07-10 13:00:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (24, 4377, 'withdrawal', 'CA', 'dev10', '2025-07-10 13:01:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 8440, 'purchase', 'US', 'dev17', '2025-07-10 13:02:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 9201, 'purchase', 'GB', 'dev20', '2025-07-10 13:03:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (4, 5518, 'withdrawal', 'US', 'dev2', '2025-07-10 13:04:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (2, 2833, 'withdrawal', 'CA', 'dev3', '2025-07-10 13:05:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (50, 8923, 'transfer', 'AU', 'dev17', '2025-07-10 13:06:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 9960, 'purchase', 'GB', 'dev5', '2025-07-10 13:07:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (39, 1178, 'purchase', 'US', 'dev12', '2025-07-10 13:08:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (23, 7404, 'purchase', 'GB', 'dev11', '2025-07-10 13:09:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (45, 771, 'withdrawal', 'CA', 'dev16', '2025-07-10 13:10:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (32, 2043, 'withdrawal', 'GB', 'dev7', '2025-07-10 13:11:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (20, 475, 'withdrawal', 'AU', 'dev2', '2025-07-10 13:12:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (27, 4690, 'withdrawal', 'CA', 'dev1', '2025-07-10 13:13:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (37, 8537, 'withdrawal', 'US', 'dev5', '2025-07-10 13:14:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (25, 41, 'transfer', 'CA', 'dev10', '2025-07-10 13:15:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (17, 393, 'purchase', 'AU', 'dev6', '2025-07-10 13:16:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (8, 6489, 'transfer', 'CA', 'dev7', '2025-07-10 13:17:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (6, 1183, 'withdrawal', 'CA', 'dev2', '2025-07-10 13:18:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (13, 8593, 'transfer', 'AU', 'dev8', '2025-07-10 13:19:00');
+INSERT INTO Transactions(account_id, amount, txn_type, country, device_id, txn_timestamp) VALUES (41, 4755, 'purchase', 'AU', 'dev18', '2025-07-10 13:20:00');
